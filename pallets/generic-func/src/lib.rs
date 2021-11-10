@@ -1,8 +1,11 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+mod rpc_types;
+mod traits;
+
 use frame_support::{
     pallet_prelude::*,
-    traits::{Currency, LockableCurrency, OnUnbalanced, Randomness},
+    traits::{Currency, OnUnbalanced, Randomness, ReservableCurrency},
 };
 use frame_system::pallet_prelude::*;
 use sp_core::H256;
@@ -10,9 +13,32 @@ use sp_runtime::{traits::BlakeTwo256, RandomNumberGenerator};
 use sp_std::prelude::*;
 
 pub use pallet::*;
-
-mod rpc_types;
 pub use rpc_types::*;
+
+pub struct ItemList;
+impl ItemList {
+    pub fn add_item<T>(a_field: &mut Vec<T>, a_item: T)
+    where
+        T: Ord,
+    {
+        if let Err(index) = a_field.binary_search(&a_item) {
+            a_field.insert(index, a_item);
+        }
+    }
+
+    pub fn rm_item<T>(a_field: &mut Vec<T>, a_item: &T)
+    where
+        T: Ord,
+    {
+        if let Ok(index) = a_field.binary_search(a_item) {
+            a_field.remove(index);
+        }
+    }
+}
+
+pub type SlashId = u64;
+pub type MachineId = Vec<u8>;
+pub type EraIndex = u32;
 
 type BalanceOf<T> = <<T as pallet::Config>::Currency as Currency<<T as frame_system::Config>::AccountId>>::Balance;
 type NegativeImbalanceOf<T> =
@@ -24,11 +50,12 @@ pub mod pallet {
 
     #[pallet::config]
     pub trait Config: frame_system::Config {
-        type Currency: LockableCurrency<Self::AccountId, Moment = Self::BlockNumber>;
+        type Currency: ReservableCurrency<Self::AccountId>;
         type Event: From<Event<Self>> + IsType<<Self as frame_system::Config>::Event>;
         type BlockPerEra: Get<u32>;
         type RandomnessSource: Randomness<H256>;
         type FixedTxFee: OnUnbalanced<NegativeImbalanceOf<Self>>;
+        type Slash: OnUnbalanced<NegativeImbalanceOf<Self>>;
     }
 
     #[pallet::pallet]
