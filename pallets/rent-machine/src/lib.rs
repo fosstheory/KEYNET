@@ -35,25 +35,9 @@ pub use pallet::*;
 pub use rpc::RpcRentOrderDetail;
 
 #[derive(Debug, PartialEq, Eq, Clone, Encode, Decode, Default)]
-pub struct RentOrderDetail<AccountId, BlockNumber, Balance> {
-    /// 租用者
-    pub renter: AccountId,
-    /// 租用开始时间
-    pub rent_start: BlockNumber,
-    /// 用户确认租成功的时间
-    pub confirm_rent: BlockNumber,
-    /// 租用结束时间
-    pub rent_end: BlockNumber,
-    /// 用户对该机器的质押
-    pub stake_amount: Balance,
-    /// 当前订单的状态
-    pub rent_status: RentStatus,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Encode, Decode, Default)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "std", serde(rename_all = "camelCase"))]
-pub struct RentOrderDetail2<AccountId, BlockNumber, Balance> {
+pub struct RentOrderDetail<AccountId, BlockNumber, Balance> {
     /// 租用者
     pub renter: AccountId,
     /// 租用开始时间
@@ -116,20 +100,11 @@ pub mod pallet {
                 for a_machine in user_rented {
                     let rent_info = Self::rent_order(&a_renter, &a_machine).unwrap_or_default();
 
-                    RentOrder2::<T>::insert(
-                        a_machine.clone(),
-                        RentOrderDetail2 {
-                            renter: rent_info.renter,
-                            rent_start: rent_info.rent_start,
-                            confirm_rent: rent_info.confirm_rent,
-                            rent_end: rent_info.rent_end,
-                            stake_amount: rent_info.stake_amount,
-                            rent_status: rent_info.rent_status,
-                        },
-                    );
                     let mut pending_rent_ending = Self::pending_rent_ending(rent_info.rent_end);
                     ItemList::add_item(&mut pending_rent_ending, a_machine.clone());
                     PendingRentEnding::<T>::insert(rent_info.rent_end, pending_rent_ending);
+
+                    RentOrder2::<T>::insert(a_machine.clone(), rent_info);
                 }
             }
 
@@ -174,7 +149,7 @@ pub mod pallet {
         _,
         Blake2_128Concat,
         MachineId,
-        RentOrderDetail2<T::AccountId, T::BlockNumber, BalanceOf<T>>,
+        RentOrderDetail<T::AccountId, T::BlockNumber, BalanceOf<T>>,
         ValueQuery,
     >;
 
@@ -246,7 +221,7 @@ pub mod pallet {
 
             RentOrder2::<T>::insert(
                 &machine_id,
-                RentOrderDetail2 {
+                RentOrderDetail {
                     renter: renter.clone(),
                     rent_start: now,
                     confirm_rent: Zero::zero(),
