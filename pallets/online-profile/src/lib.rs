@@ -538,7 +538,7 @@ pub mod pallet {
                 Self::distribute_reward();
             }
 
-            let _ = Self::do_pending_slash();
+            // let _ = Self::do_pending_slash();
         }
     }
 
