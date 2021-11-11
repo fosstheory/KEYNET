@@ -19,7 +19,9 @@ pub trait RTOps {
     type AccountId;
     type MachineId;
     type MachineStatus;
-    type BalanceOf;
+    type Balance;
+
+    fn get_machine_price(machine_point: u64) -> Option<u64>;
 
     fn change_machine_status(
         machine_id: &Self::MachineId,
@@ -28,7 +30,7 @@ pub trait RTOps {
         rent_duration: Option<u64>, // 不为None时，表示租用结束
     );
 
-    fn change_machine_rent_fee(amount: Self::BalanceOf, machine_id: Self::MachineId, is_burn: bool);
+    fn change_machine_rent_fee(amount: Self::Balance, machine_id: Self::MachineId, is_burn: bool);
 }
 
 pub trait OPRPCQuery {

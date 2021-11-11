@@ -6270,6 +6270,7 @@ dependencies = [
 name = "rent-machine-runtime-api"
 version = "0.1.0"
 dependencies = [
+ "generic-func",
  "parity-scale-codec",
  "rent-machine",
  "sp-api",

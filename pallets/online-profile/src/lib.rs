@@ -2332,7 +2332,17 @@ impl<T: Config> RTOps for Pallet<T> {
     type MachineId = MachineId;
     type MachineStatus = MachineStatus<T::BlockNumber, T::AccountId>;
     type AccountId = T::AccountId;
-    type BalanceOf = BalanceOf<T>;
+    type Balance = BalanceOf<T>;
+
+    fn get_machine_price(machine_point: u64) -> Option<u64> {
+        let standard_gpu_point_price = Self::standard_gpu_point_price()?;
+        standard_gpu_point_price
+            .gpu_price
+            .checked_mul(machine_point)?
+            .checked_mul(10_000)?
+            .checked_div(standard_gpu_point_price.gpu_point)?
+            .checked_div(10_000)
+    }
 
     fn change_machine_status(
         machine_id: &MachineId,
