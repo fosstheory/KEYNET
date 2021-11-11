@@ -59,9 +59,9 @@ pub trait ManageCommittee {
 }
 
 pub trait DbcPrice {
-    type BalanceOf;
+    type Balance;
 
-    fn get_dbc_amount_by_value(value: u64) -> Option<Self::BalanceOf>;
+    fn get_dbc_amount_by_value(value: u64) -> Option<Self::Balance>;
 }
 
 pub trait MTOps {

@@ -1,7 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 // use alt_serde::{Deserialize, Deserializer};
-use frame_support::traits::{Currency, LockableCurrency, Randomness};
+use frame_support::traits::{Currency, Randomness, ReservableCurrency};
 use frame_system::offchain::SubmitTransaction;
 use online_profile_machine::DbcPrice;
 use sp_core::H256;
@@ -9,7 +9,7 @@ use sp_runtime::{
     offchain::{http, Duration},
     traits::{CheckedDiv, CheckedMul, SaturatedConversion},
 };
-use sp_std::{str, vec::Vec};
+use sp_std::{collections::vec_deque::VecDeque, str, vec::Vec};
 
 pub use pallet::*;
 pub mod parse_price;
@@ -32,7 +32,7 @@ pub mod pallet {
     pub trait Config: frame_system::Config + CreateSignedTransaction<Call<Self>> + generic_func::Config {
         type Event: From<Event<Self>> + IsType<<Self as frame_system::Config>::Event>;
         type RandomnessSource: Randomness<H256>;
-        type Currency: LockableCurrency<Self::AccountId, Moment = Self::BlockNumber>;
+        type Currency: ReservableCurrency<Self::AccountId>;
     }
 
     #[pallet::pallet]
@@ -41,7 +41,7 @@ pub mod pallet {
 
     #[pallet::storage]
     #[pallet::getter(fn prices)]
-    pub type Prices<T> = StorageValue<_, Vec<u64>, ValueQuery>;
+    pub type Prices<T> = StorageValue<_, VecDeque<u64>, ValueQuery>;
 
     // https://min-api.cryptocompare.com/data/price?fsym=DBC&tsyms=USD
     #[pallet::storage]
@@ -113,7 +113,11 @@ pub mod pallet {
             let mut price_url = Self::price_url().unwrap_or_default();
             ensure!(index < price_url.len() as u32, Error::<T>::IndexOutOfRange);
             price_url.remove(index as usize);
-            PriceURL::<T>::put(price_url);
+            if price_url.len() == 0 {
+                PriceURL::<T>::kill();
+            } else {
+                PriceURL::<T>::put(price_url);
+            }
             Ok(().into())
         }
     }
@@ -184,11 +188,10 @@ impl<T: Config> Pallet<T> {
     // 存储获取到的价格
     pub fn add_price(price: u64) {
         let mut prices = Prices::<T>::get();
-        if prices.len() < MAX_LEN {
-            prices.push(price);
-        } else {
-            prices[price as usize % MAX_LEN] = price;
+        if prices.len() >= MAX_LEN {
+            prices.pop_front();
         }
+        prices.push_back(price);
 
         Prices::<T>::put(prices);
         Self::deposit_event(Event::AddNewPrice(price));
@@ -207,11 +210,11 @@ impl<T: Config> Pallet<T> {
 }
 
 impl<T: Config> DbcPrice for Pallet<T> {
-    type BalanceOf = BalanceOf<T>;
+    type Balance = BalanceOf<T>;
 
-    fn get_dbc_amount_by_value(value: u64) -> Option<Self::BalanceOf> {
-        let one_dbc: Self::BalanceOf = 1000_000_000_000_000u64.saturated_into();
-        let dbc_price: Self::BalanceOf = Self::avg_price()?.saturated_into();
-        value.saturated_into::<Self::BalanceOf>().checked_mul(&one_dbc)?.checked_div(&dbc_price)
+    fn get_dbc_amount_by_value(value: u64) -> Option<Self::Balance> {
+        let one_dbc: Self::Balance = 1000_000_000_000_000u64.saturated_into();
+        let dbc_price: Self::Balance = Self::avg_price()?.saturated_into();
+        value.saturated_into::<Self::Balance>().checked_mul(&one_dbc)?.checked_div(&dbc_price)
     }
 }
