@@ -79,7 +79,7 @@ pub mod pallet {
             AccountId = Self::AccountId,
             BalanceOf = BalanceOf<Self>,
         >;
-        type DbcPrice: DbcPrice<BalanceOf = BalanceOf<Self>>;
+        type DbcPrice: DbcPrice<Balance = BalanceOf<Self>>;
     }
 
     #[pallet::pallet]
