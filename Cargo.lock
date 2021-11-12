@@ -4388,6 +4388,7 @@ dependencies = [
 name = "online-committee-runtime-api"
 version = "0.1.0"
 dependencies = [
+ "generic-func",
  "online-committee",
  "parity-scale-codec",
  "sp-api",

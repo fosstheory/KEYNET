@@ -334,7 +334,7 @@ pub mod pallet {
         type Currency: ReservableCurrency<Self::AccountId>;
         type BondingDuration: Get<EraIndex>;
         type DbcPrice: DbcPrice<Balance = BalanceOf<Self>>;
-        type ManageCommittee: ManageCommittee<AccountId = Self::AccountId, BalanceOf = BalanceOf<Self>>;
+        type ManageCommittee: ManageCommittee<AccountId = Self::AccountId, Balance = BalanceOf<Self>>;
         type Slash: OnUnbalanced<NegativeImbalanceOf<Self>>;
         type CancelSlashOrigin: EnsureOrigin<Self::Origin>;
     }
@@ -2100,7 +2100,7 @@ impl<T: Config> Pallet<T> {
                 Perbill::from_rational_approximation(1u64, machine_info.reward_committee.len() as u64) *
                     release_to_committee;
             for a_committee in machine_info.reward_committee.clone() {
-                T::ManageCommittee::add_reward(a_committee, committee_each_get);
+                // T::ManageCommittee::add_reward(a_committee, committee_each_get);
             }
         }
 
@@ -2113,6 +2113,7 @@ impl<T: Config> OCOps for Pallet<T> {
     type MachineId = MachineId;
     type AccountId = T::AccountId;
     type CommitteeUploadInfo = CommitteeUploadInfo;
+    type Balance = BalanceOf<T>;
 
     // 委员会订阅了一个机器ID
     // 将机器状态从ocw_confirmed_machine改为booked_machine，同时将机器状态改为booked
@@ -2243,7 +2244,7 @@ impl<T: Config> OCOps for Pallet<T> {
     }
 
     // When committees reach an agreement to refuse machine, change machine status and record refuse time
-    fn oc_refuse_machine(machine_id: MachineId, committee: Vec<T::AccountId>) -> Result<(), ()> {
+    fn oc_refuse_machine(machine_id: MachineId) -> Option<(T::AccountId, BalanceOf<T>)> {
         // Refuse controller bond machine, and clean storage
         let machine_info = Self::machines_info(&machine_id);
         let mut live_machines = Self::live_machines();
@@ -2264,7 +2265,7 @@ impl<T: Config> OCOps for Pallet<T> {
                 slash_amount: reonline_stake.stake_amount,
                 slash_exec_time: now + (2880u32 * 2).saturated_into::<T::BlockNumber>(),
                 reward_to_reporter: None,
-                reward_to_committee: Some(committee),
+                reward_to_committee: None,
                 slash_reason: OPSlashReason::CommitteeRefusedMutHardware,
             };
             PendingSlash::<T>::insert(slash_id, slash_info);
@@ -2273,7 +2274,8 @@ impl<T: Config> OCOps for Pallet<T> {
             LiveMachine::add_machine_id(&mut live_machines.bonding_machine, machine_id.clone());
 
             LiveMachines::<T>::put(live_machines);
-            return Ok(())
+            // TODO: change here
+            return None
         }
 
         let now = <frame_system::Module<T>>::block_number();
@@ -2281,15 +2283,15 @@ impl<T: Config> OCOps for Pallet<T> {
         let mut stash_machines = Self::stash_machines(&machine_info.machine_stash);
         let mut controller_machines = Self::controller_machines(&machine_info.controller);
 
-        sys_info.total_stake = sys_info.total_stake.checked_sub(&machine_info.stake_amount).ok_or(())?;
+        sys_info.total_stake = sys_info.total_stake.checked_sub(&machine_info.stake_amount)?;
 
         // Slash 5% of init stake(5% of one gpu stake)
         let slash = Perbill::from_rational_approximation(5u64, 100u64) * machine_info.stake_amount;
-        let left_stake = machine_info.stake_amount.checked_sub(&slash).ok_or(())?;
+        let left_stake = machine_info.stake_amount.checked_sub(&slash)?;
 
         // Return 95% left stake(95% of one gpu stake)
         <T as pallet::Config>::Currency::unreserve(&machine_info.machine_stash, left_stake);
-        stash_stake = stash_stake.checked_sub(&left_stake).ok_or(())?;
+        stash_stake = stash_stake.checked_sub(&left_stake)?;
 
         // Add a pending slash
         let slash_id = Self::get_new_slash_id();
@@ -2324,6 +2326,25 @@ impl<T: Config> OCOps for Pallet<T> {
         StashMachines::<T>::insert(&machine_info.machine_stash, stash_machines);
         SysInfo::<T>::put(sys_info);
 
+        None
+    }
+
+    // stake some balance when apply for slash review
+    // Should stake some balance when apply for slash review
+    fn oc_change_staked_balance(stash: T::AccountId, amount: BalanceOf<T>, is_add: bool) -> Result<(), ()> {
+        Self::change_user_total_stake(stash, amount, is_add)
+    }
+
+    // just change stash_stake & sys_info, slash and reward should be execed in oc module
+    fn oc_exec_slash(stash: T::AccountId, amount: BalanceOf<T>) -> Result<(), ()> {
+        let mut stash_stake = Self::stash_stake(&stash);
+        let mut sys_info = Self::sys_info();
+
+        sys_info.total_stake = sys_info.total_stake.checked_sub(&amount).ok_or(())?;
+        stash_stake = stash_stake.checked_sub(&amount).ok_or(())?;
+
+        StashStake::<T>::insert(&stash, stash_stake);
+        SysInfo::<T>::put(sys_info);
         Ok(())
     }
 }

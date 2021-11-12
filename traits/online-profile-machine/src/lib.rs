@@ -7,12 +7,15 @@ pub trait OCOps {
     type AccountId;
     type MachineId;
     type CommitteeUploadInfo;
+    type Balance;
 
     fn oc_booked_machine(id: Self::MachineId);
     fn oc_revert_booked_machine(id: Self::MachineId);
 
     fn oc_confirm_machine(who: Vec<Self::AccountId>, machine_info: Self::CommitteeUploadInfo) -> Result<(), ()>;
-    fn oc_refuse_machine(machien_id: Self::MachineId, committee: Vec<Self::AccountId>) -> Result<(), ()>;
+    fn oc_refuse_machine(machien_id: Self::MachineId) -> Option<(Self::AccountId, Self::Balance)>;
+    fn oc_change_staked_balance(stash: Self::AccountId, amount: Self::Balance, is_add: bool) -> Result<(), ()>;
+    fn oc_exec_slash(stash: Self::AccountId, amount: Self::Balance) -> Result<(), ()>;
 }
 
 pub trait RTOps {
@@ -43,21 +46,17 @@ pub trait OPRPCQuery {
 
 pub trait ManageCommittee {
     type AccountId;
-    type BalanceOf;
-    type SlashReason;
+    type Balance;
+    type ReportId;
 
     fn is_valid_committee(who: &Self::AccountId) -> bool;
-
-    fn available_committee() -> Result<Vec<Self::AccountId>, ()>;
-    fn change_used_stake(committee: Self::AccountId, amount: Self::BalanceOf, is_add: bool) -> Result<(), ()>;
-    fn stake_per_order() -> Option<Self::BalanceOf>;
-    fn add_reward(committee: Self::AccountId, reward: Self::BalanceOf);
-    fn add_slash(
-        who: Self::AccountId,
-        amount: Self::BalanceOf,
-        reward_to: Vec<Self::AccountId>,
-        slash_reason: Self::SlashReason,
-    );
+    fn available_committee() -> Option<Vec<Self::AccountId>>;
+    // Only change stake record, not influence actual stake
+    fn change_used_stake(committee: Self::AccountId, amount: Self::Balance, is_add: bool) -> Result<(), ()>;
+    // Only change stake record, not influence actual stake
+    fn change_total_stake(committee: Self::AccountId, amount: Self::Balance, is_add: bool) -> Result<(), ()>;
+    fn stake_per_order() -> Option<Self::Balance>;
+    fn add_reward(committee: Self::AccountId, reward: Self::Balance);
 }
 
 pub trait DbcPrice {
