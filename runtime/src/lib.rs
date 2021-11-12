@@ -112,7 +112,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
     // and set impl_version to 0. If only runtime
     // implementation changes and behavior does not, then leave spec_version as
     // is and increment impl_version.
-    spec_version: 336,
+    spec_version: 337,
     impl_version: 0,
     apis: RUNTIME_API_VERSIONS,
     transaction_version: 2,
@@ -1017,7 +1017,8 @@ impl online_profile::Config for Runtime {
     type DbcPrice = DBCPriceOCW;
     type ManageCommittee = Committee;
     type Slash = Treasury;
-    type CancelSlashOrigin = pallet_collective::EnsureProportionAtLeast<_2, _3, AccountId, TechnicalCollective>;
+    type CancelSlashOrigin = pallet_collective::EnsureProportionAtLeast<_1, _5, AccountId, TechnicalCollective>;
+    type SlashAndReward = GenericFunc;
 }
 
 impl simple_rpc::Config for Runtime {
@@ -1174,7 +1175,7 @@ impl_runtime_apis! {
             OnlineProfile::get_machine_list()
         }
 
-        fn get_machine_info(machine_id: online_profile::MachineId) -> online_profile::MachineInfo<AccountId, BlockNumber, Balance> {
+        fn get_machine_info(machine_id: generic_func::MachineId) -> online_profile::MachineInfo<AccountId, BlockNumber, Balance> {
             OnlineProfile::get_machine_info(machine_id)
         }
 
@@ -1182,11 +1183,11 @@ impl_runtime_apis! {
             OnlineProfile::get_pos_gpu_info()
         }
 
-        fn get_machine_era_reward(machine_id: online_profile::MachineId, era_index: online_profile::EraIndex) -> Balance {
+        fn get_machine_era_reward(machine_id: generic_func::MachineId, era_index: online_profile::EraIndex) -> Balance {
             OnlineProfile::get_machine_era_reward(machine_id, era_index)
         }
 
-        fn get_machine_era_released_reward(machine_id: online_profile::MachineId, era_index: online_profile::EraIndex) -> Balance {
+        fn get_machine_era_released_reward(machine_id: generic_func::MachineId, era_index: online_profile::EraIndex) -> Balance {
             OnlineProfile::get_machine_era_released_reward(machine_id, era_index)
         }
 
@@ -1216,25 +1217,25 @@ impl_runtime_apis! {
             OnlineCommittee::get_committee_machine_list(committee)
         }
 
-        fn get_committee_ops(committee: AccountId, machine_id: online_profile::MachineId) -> online_committee::RpcOCCommitteeOps<BlockNumber, Balance> {
+        fn get_committee_ops(committee: AccountId, machine_id: generic_func::MachineId) -> online_committee::RpcOCCommitteeOps<BlockNumber, Balance> {
             OnlineCommittee::get_committee_ops(committee, machine_id)
         }
 
-        fn get_machine_committee_list(machine_id: online_profile::MachineId) -> online_committee::OCMachineCommitteeList<AccountId, BlockNumber> {
+        fn get_machine_committee_list(machine_id: generic_func::MachineId) -> online_committee::OCMachineCommitteeList<AccountId, BlockNumber> {
             OnlineCommittee::get_machine_committee_list(machine_id)
         }
     }
 
     impl rent_machine_runtime_api::RmRpcApi<Block, AccountId, BlockNumber, Balance> for Runtime {
-        fn get_rent_order(renter: AccountId, machine_id: online_profile::MachineId) -> rent_machine::RpcRentOrderDetail<AccountId, BlockNumber, Balance> {
+        fn get_rent_order(renter: AccountId, machine_id: generic_func::MachineId) -> rent_machine::RpcRentOrderDetail<AccountId, BlockNumber, Balance> {
             RentMachine::get_rent_order(renter, machine_id)
         }
 
-        fn get_rent_list(renter: AccountId) -> Vec<online_profile::MachineId> {
+        fn get_rent_list(renter: AccountId) -> Vec<generic_func::MachineId> {
             RentMachine::get_rent_list(renter)
         }
 
-        fn get_machine_renter(machine_id: online_profile::MachineId) -> Option<AccountId>
+        fn get_machine_renter(machine_id: generic_func::MachineId) -> Option<AccountId>
         {
             RentMachine::get_machine_renter(machine_id)
         }

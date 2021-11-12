@@ -11,7 +11,8 @@ use frame_support::{
     IterableStorageDoubleMap, IterableStorageMap,
 };
 use frame_system::pallet_prelude::*;
-use online_profile_machine::{DbcPrice, MTOps, ManageCommittee, OCOps, OPRPCQuery, RTOps};
+use generic_func::{ItemList, MachineId, SlashId};
+use online_profile_machine::{DbcPrice, GNOps, MTOps, ManageCommittee, OCOps, OPRPCQuery, RTOps};
 #[cfg(feature = "std")]
 use serde::{Deserialize, Serialize};
 use sp_core::{crypto::Public, H256};
@@ -20,8 +21,9 @@ use sp_runtime::{
     Perbill, SaturatedConversion,
 };
 use sp_std::{
-    collections::btree_map::BTreeMap,
+    collections::{btree_map::BTreeMap, vec_deque::VecDeque},
     convert::{From, TryFrom, TryInto},
+    ops::{Add, Sub},
     prelude::*,
     str,
     vec::Vec,
@@ -41,6 +43,11 @@ pub const BLOCK_PER_ERA: u64 = 2880;
 pub const REWARD_DURATION: u32 = 365 * 2;
 /// Rebond frequency, 1 year
 pub const REBOND_FREQUENCY: u32 = 365 * 2880;
+
+/// Max Slash Threshold: 120h, 5 era
+pub const MAX_SLASH_THRESHOLD: u32 = 2880 * 5;
+/// PendingSlash will be exec in two days
+pub const TWO_DAY: u32 = 5760;
 
 /// stash account overview self-status
 #[derive(PartialEq, Eq, Clone, Encode, Decode, Default, RuntimeDebug)]
@@ -223,20 +230,6 @@ impl LiveMachine {
         }
         false
     }
-
-    /// Add machine_id to one field of LiveMachine
-    fn add_machine_id(a_field: &mut Vec<MachineId>, machine_id: MachineId) {
-        if let Err(index) = a_field.binary_search(&machine_id) {
-            a_field.insert(index, machine_id);
-        }
-    }
-
-    /// Delete machine_id from one field of LiveMachine
-    fn rm_machine_id(a_field: &mut Vec<MachineId>, machine_id: &MachineId) {
-        if let Ok(index) = a_field.binary_search(machine_id) {
-            a_field.remove(index);
-        }
-    }
 }
 
 #[derive(PartialEq, Eq, Clone, Encode, Decode, Default, RuntimeDebug)]
@@ -247,6 +240,18 @@ pub struct OnlineStakeParamsInfo<Balance> {
     pub online_stake_usd_limit: u64,
     /// How much should stake when want reonline (change hardware info). USD*10^6
     pub reonline_stake: u64,
+}
+
+#[derive(PartialEq, Eq, Clone, Encode, Decode, Default, RuntimeDebug)]
+pub struct OnlineStakeParamsInfo2<Balance> {
+    /// How much a GPU should stake(DBC).eg. 100_000 DBC
+    pub online_stake_per_gpu: Balance,
+    /// Limit of value of one GPU's actual stake。USD*10^6
+    pub online_stake_usd_limit: u64,
+    /// How much should stake when want reonline (change hardware info). USD*10^6
+    pub reonline_stake: u64,
+    /// How much should stake when apply_slash_review
+    pub slash_review_stake: Balance,
 }
 
 /// Standard GPU rent price Per Era
@@ -260,6 +265,12 @@ pub struct StandardGpuPointPrice {
 
 #[derive(PartialEq, Eq, Clone, Encode, Decode, Default, RuntimeDebug)]
 pub struct UserReonlineStakeInfo<Balance, BlockNumber> {
+    pub stake_amount: Balance,
+    pub offline_time: BlockNumber,
+}
+
+#[derive(PartialEq, Eq, Clone, Encode, Decode, Default, RuntimeDebug)]
+pub struct UserMutHardwareStakeInfo<Balance, BlockNumber> {
     pub stake_amount: Balance,
     pub offline_time: BlockNumber,
 }
@@ -324,6 +335,60 @@ pub struct OPPendingSlashInfo<AccountId, BlockNumber, Balance> {
     pub slash_reason: OPSlashReason<BlockNumber>,
 }
 
+// 365 day per year
+// Testnet start from 2021-07-18, after 3 years(365*3), in 2024-07-17, phase 1 should end.
+// If galxy is on, Reward is double in 60 eras. So, phase 1 should end in 2024-05-18 (365*3-60)
+// So, **first_phase_duration** should equal: 365 * 3 - 60 - (online_day - 2021-0718)
+#[derive(PartialEq, Eq, Clone, Encode, Decode, Default, RuntimeDebug)]
+pub struct PhaseRewardInfoDetail<Balance> {
+    pub online_reward_start_era: EraIndex, // When online reward will start
+    pub first_phase_duration: EraIndex,
+    pub galaxy_on_era: EraIndex,         // When galaxy is on
+    pub phase_0_reward_per_era: Balance, // first 3 years
+    pub phase_1_reward_per_era: Balance, // next 5 years
+    pub phase_2_reward_per_era: Balance, // next 5 years
+}
+
+#[derive(PartialEq, Eq, Clone, Encode, Decode, Default, RuntimeDebug)]
+pub struct MachineRecentRewardInfo<AccountId, Balance> {
+    // machine total reward(committee reward included)
+    pub machine_stash: AccountId,
+    pub recent_machine_reward: VecDeque<Balance>,
+    pub recent_reward_sum: Balance,
+
+    pub reward_committee_deadline: EraIndex,
+    pub reward_committee: Vec<AccountId>,
+}
+
+// NOTE: Call order of add_new_reward and get_..released is very important
+// Add new reward first, then calc committee/stash released reward
+impl<AccountId, Balance> MachineRecentRewardInfo<AccountId, Balance>
+where
+    Balance: Default + Clone + Add<Output = Balance> + Sub<Output = Balance> + Copy,
+{
+    pub fn add_new_reward(&mut self, reward_amount: Balance) {
+        let mut reduce = Balance::default();
+
+        if self.recent_machine_reward.len() == 150 {
+            reduce = self.recent_machine_reward.pop_front().unwrap();
+            self.recent_machine_reward.push_back(reward_amount);
+        } else {
+            self.recent_machine_reward.push_back(reward_amount);
+        }
+
+        self.recent_reward_sum = self.recent_reward_sum + reward_amount - reduce;
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, Encode, Decode, Default, RuntimeDebug)]
+pub struct OPPendingSlashReviewInfo<AccountId, Balance, BlockNumber> {
+    pub applicant: AccountId,
+    pub staked_amount: Balance,
+    pub apply_time: BlockNumber,
+    pub expire_time: BlockNumber,
+    pub reason: Vec<u8>,
+}
+
 #[frame_support::pallet]
 pub mod pallet {
     use super::*;
@@ -337,6 +402,7 @@ pub mod pallet {
         type ManageCommittee: ManageCommittee<AccountId = Self::AccountId, Balance = BalanceOf<Self>>;
         type Slash: OnUnbalanced<NegativeImbalanceOf<Self>>;
         type CancelSlashOrigin: EnsureOrigin<Self::Origin>;
+        type SlashAndReward: GNOps<AccountId = Self::AccountId, Balance = BalanceOf<Self>>;
     }
 
     #[pallet::pallet]
@@ -347,21 +413,40 @@ pub mod pallet {
     #[pallet::getter(fn online_stake_params)]
     pub(super) type OnlineStakeParams<T: Config> = StorageValue<_, OnlineStakeParamsInfo<BalanceOf<T>>>;
 
+    #[pallet::storage]
+    #[pallet::getter(fn online_stake_params2)]
+    pub(super) type OnlineStakeParams2<T: Config> = StorageValue<_, OnlineStakeParamsInfo2<BalanceOf<T>>>;
+
     /// A standard example for rent fee calculation(price: USD*10^6)
     #[pallet::storage]
     #[pallet::getter(fn standard_gpu_point_price)]
     pub(super) type StandardGPUPointPrice<T: Config> = StorageValue<_, StandardGpuPointPrice>;
 
+    // /// Reonline to change hardware, should stake some balance
+    // #[pallet::storage]
+    // #[pallet::getter(fn user_reonline_stake)]
+    // pub(super) type UserReonlineStake<T: Config> = StorageDoubleMap<
+    //     _,
+    //     Blake2_128Concat,
+    //     T::AccountId,
+    //     Blake2_128Concat,
+    //     MachineId,
+    //     UserReonlineStakeInfo<BalanceOf<T>, T::BlockNumber>,
+    //     ValueQuery,
+    // >;
+
+    // TODO: FIXME 上面变成了下面
+
     /// Reonline to change hardware, should stake some balance
     #[pallet::storage]
-    #[pallet::getter(fn user_reonline_stake)]
-    pub(super) type UserReonlineStake<T: Config> = StorageDoubleMap<
+    #[pallet::getter(fn user_mut_hardware_stake)]
+    pub(super) type UserMutHardwareStake<T: Config> = StorageDoubleMap<
         _,
         Blake2_128Concat,
         T::AccountId,
         Blake2_128Concat,
         MachineId,
-        UserReonlineStakeInfo<BalanceOf<T>, T::BlockNumber>,
+        UserMutHardwareStakeInfo<BalanceOf<T>, T::BlockNumber>,
         ValueQuery,
     >;
 
@@ -369,6 +454,15 @@ pub mod pallet {
     #[pallet::storage]
     #[pallet::getter(fn galaxy_is_on)]
     pub(super) type GalaxyIsOn<T: Config> = StorageValue<_, bool, ValueQuery>;
+
+    #[pallet::type_value]
+    pub(super) fn GalaxyOnGPUThresholdDefault<T: Config>() -> u32 {
+        5000
+    }
+
+    #[pallet::storage]
+    #[pallet::getter(fn galaxy_on_gpu_threshold)]
+    pub(super) type GalaxyOnGPUThreshold<T: Config> = StorageValue<_, u32, ValueQuery, GalaxyOnGPUThresholdDefault<T>>;
 
     /// Statistics of gpu and stake
     #[pallet::storage]
@@ -406,10 +500,11 @@ pub mod pallet {
     #[pallet::getter(fn stash_server_rooms)]
     pub(super) type StashServerRooms<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, Vec<H256>, ValueQuery>;
 
-    /// All machines in one server room
-    #[pallet::storage]
-    #[pallet::getter(fn server_room_machines)]
-    pub(super) type ServerRoomMachines<T: Config> = StorageMap<_, Blake2_128Concat, H256, Vec<MachineId>>;
+    // TODO: 删掉这里
+    // /// All machines in one server room
+    // #[pallet::storage]
+    // #[pallet::getter(fn server_room_machines)]
+    // pub(super) type ServerRoomMachines<T: Config> = StorageMap<_, Blake2_128Concat, H256, Vec<MachineId>>;
 
     /// All machines controlled by controller
     #[pallet::storage]
@@ -433,16 +528,35 @@ pub mod pallet {
     pub(super) type ErasStashPoints<T: Config> =
         StorageMap<_, Blake2_128Concat, EraIndex, EraStashPoints<T::AccountId>>;
 
+    // TODO: FIXME: !! !!! 变成下面的
+    /// 每个Era机器的得分快照
+    #[pallet::storage]
+    #[pallet::getter(fn eras_stash_points2)]
+    pub(super) type ErasStashPoints2<T: Config> =
+        StorageMap<_, Blake2_128Concat, EraIndex, EraStashPoints<T::AccountId>, ValueQuery>;
+
     /// 每个Era机器的得分快照
     #[pallet::storage]
     #[pallet::getter(fn eras_machine_points)]
     pub(super) type ErasMachinePoints<T: Config> =
         StorageMap<_, Blake2_128Concat, EraIndex, BTreeMap<MachineId, MachineGradeStatus>>;
 
+    // FIXME: 变成下面
+    /// 每个Era机器的得分快照
+    #[pallet::storage]
+    #[pallet::getter(fn eras_machine_points2)]
+    pub(super) type ErasMachinePoints2<T: Config> =
+        StorageMap<_, Blake2_128Concat, EraIndex, BTreeMap<MachineId, MachineGradeStatus>, ValueQuery>;
+
     /// 在线奖励开始时间
     #[pallet::storage]
     #[pallet::getter(fn reward_start_era)]
     pub(super) type RewardStartEra<T: Config> = StorageValue<_, EraIndex>;
+
+    // FIXME 变成下面
+    #[pallet::storage]
+    #[pallet::getter(fn phase_reward_info)]
+    pub(super) type PhaseRewardInfo<T: Config> = StorageValue<_, PhaseRewardInfoDetail<BalanceOf<T>>>;
 
     #[pallet::storage]
     #[pallet::getter(fn era_reward)]
@@ -472,6 +586,19 @@ pub mod pallet {
     pub(super) type ErasStashReleasedReward<T: Config> =
         StorageDoubleMap<_, Blake2_128Concat, EraIndex, Blake2_128Concat, T::AccountId, BalanceOf<T>, ValueQuery>;
 
+    // TODO: 新加变量
+    /// store max 150 era reward
+    #[pallet::storage]
+    #[pallet::getter(fn machine_recent_reward)]
+    pub(super) type MachineRecentReward<T: Config> =
+        StorageMap<_, Blake2_128Concat, MachineId, MachineRecentRewardInfo<T::AccountId, BalanceOf<T>>, ValueQuery>;
+
+    // TODO: 生成这个
+    #[pallet::storage]
+    #[pallet::getter(fn all_machine_id_snap)]
+    pub(super) type AllMachineIdSnap<T: Config> = StorageValue<_, (VecDeque<MachineId>, u64), ValueQuery>;
+
+    // FIXME 删除下面的变量
     /// 不同阶段不同奖励
     #[pallet::storage]
     #[pallet::getter(fn phase_n_reward_per_era)]
@@ -496,75 +623,98 @@ pub mod pallet {
         ValueQuery,
     >;
 
+    #[pallet::storage]
+    #[pallet::getter(fn pending_slash_review)]
+    pub(super) type PendingSlashReview<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        SlashId,
+        OPPendingSlashReviewInfo<T::AccountId, BalanceOf<T>, T::BlockNumber>,
+        ValueQuery,
+    >;
+
+    #[pallet::storage]
+    #[pallet::getter(fn rented_finished)]
+    pub(super) type RentedFinished<T: Config> = StorageMap<_, Blake2_128Concat, MachineId, T::AccountId, ValueQuery>;
+
     #[pallet::hooks]
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
         fn on_runtime_upgrade() -> Weight {
+            // 1. userReonlinestakeinfo -> usermuthardwarestakeinfo
+
+            // 2. eras_stash_points 1 -> 2
+
+            // 3. eras_machine_points 1 -> 2
+
+            // 4. phase_reward_info 的设置
+
+            // 5. 生成machine_recent_reward
+
+            // 6. 生成all_machine_id_snap
             0
         }
 
         fn on_initialize(block_number: T::BlockNumber) -> Weight {
-            // Era开始时，生成当前Era和下一个Era的快照
-            // 每个Era(2880个块)执行一次
+            Self::backup_and_reward(block_number);
+
             if block_number.saturated_into::<u64>() % BLOCK_PER_ERA == 1 {
-                let current_era: u32 = (block_number.saturated_into::<u64>() / BLOCK_PER_ERA) as u32;
-                CurrentEra::<T>::put(current_era);
-
-                let era_reward = Self::current_era_reward().unwrap_or_default();
-                EraReward::<T>::insert(current_era, era_reward);
-
-                if current_era == 0 {
-                    ErasStashPoints::<T>::insert(0, EraStashPoints { ..Default::default() });
-                    ErasStashPoints::<T>::insert(1, EraStashPoints { ..Default::default() });
-                    let init_value: BTreeMap<MachineId, MachineGradeStatus> = BTreeMap::new();
-                    ErasMachinePoints::<T>::insert(0, init_value.clone());
-                    ErasMachinePoints::<T>::insert(1, init_value);
-                } else {
-                    // 用当前的Era快照初始化下一个Era的信息
-                    let current_era_stash_snapshot = Self::eras_stash_points(current_era).unwrap_or_default();
-                    ErasStashPoints::<T>::insert(current_era + 1, current_era_stash_snapshot);
-                    let current_era_machine_snapshot = Self::eras_machine_points(current_era).unwrap_or_default();
-                    ErasMachinePoints::<T>::insert(current_era + 1, current_era_machine_snapshot);
-                }
+                // Era开始时，生成当前Era和下一个Era的快照
+                // 每个Era(2880个块)执行一次
+                Self::update_snap_for_new_era();
             }
+            Self::check_offline_machine_duration();
+            Self::do_pending_slash();
             0
         }
 
-        fn on_finalize(block_number: T::BlockNumber) {
-            let current_height = block_number.saturated_into::<u64>();
+        // fn on_finalize(block_number: T::BlockNumber) {
+        //     // let current_height = block_number.saturated_into::<u64>();
 
-            // 在每个Era结束时执行奖励，发放到用户的Machine
-            // 计算奖励，直接根据当前得分即可
-            if current_height > 0 && current_height % BLOCK_PER_ERA == 0 {
-                Self::distribute_reward();
-            }
+        //     // // 在每个Era结束时执行奖励，发放到用户的Machine
+        //     // // 计算奖励，直接根据当前得分即可
+        //     // if current_height > 0 && current_height % BLOCK_PER_ERA == 0 {
+        //     //     Self::distribute_reward();
+        //     // }
 
-            // let _ = Self::do_pending_slash();
-        }
+        //     // let _ = Self::do_pending_slash();
+        // }
     }
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
+        // /// When reward start to distribute
+        // #[pallet::weight(0)]
+        // pub fn set_reward_start_era(origin: OriginFor<T>, reward_start_era: EraIndex) -> DispatchResultWithPostInfo {
+        //     ensure_root(origin)?;
+        //     RewardStartEra::<T>::put(reward_start_era);
+        //     Ok(().into())
+        // }
+
+        // FIXME: 上面改成下面
         /// When reward start to distribute
         #[pallet::weight(0)]
-        pub fn set_reward_start_era(origin: OriginFor<T>, reward_start_era: EraIndex) -> DispatchResultWithPostInfo {
+        pub fn set_reward_info(
+            origin: OriginFor<T>,
+            reward_info: PhaseRewardInfoDetail<BalanceOf<T>>,
+        ) -> DispatchResultWithPostInfo {
             ensure_root(origin)?;
-            RewardStartEra::<T>::put(reward_start_era);
+            <PhaseRewardInfo<T>>::put(reward_info);
             Ok(().into())
         }
 
-        #[pallet::weight(0)]
-        pub fn set_phase_n_reward_per_era(
-            origin: OriginFor<T>,
-            phase: u32,
-            reward_per_era: BalanceOf<T>,
-        ) -> DispatchResultWithPostInfo {
-            ensure_root(origin)?;
-            match phase {
-                0..=5 => PhaseNRewardPerEra::<T>::insert(phase, reward_per_era),
-                _ => return Err(Error::<T>::RewardPhaseOutOfRange.into()),
-            }
-            Ok(().into())
-        }
+        // #[pallet::weight(0)]
+        // pub fn set_phase_n_reward_per_era(
+        //     origin: OriginFor<T>,
+        //     phase: u32,
+        //     reward_per_era: BalanceOf<T>,
+        // ) -> DispatchResultWithPostInfo {
+        //     ensure_root(origin)?;
+        //     match phase {
+        //         0..=5 => PhaseNRewardPerEra::<T>::insert(phase, reward_per_era),
+        //         _ => return Err(Error::<T>::RewardPhaseOutOfRange.into()),
+        //     }
+        //     Ok(().into())
+        // }
 
         #[pallet::weight(0)]
         pub fn set_online_stake_params(
@@ -584,6 +734,26 @@ pub mod pallet {
         ) -> DispatchResultWithPostInfo {
             ensure_root(origin)?;
             StandardGPUPointPrice::<T>::put(point_price);
+            Ok(().into())
+        }
+
+        #[pallet::weight(0)]
+        pub fn set_galaxy_on(origin: OriginFor<T>, is_on: bool) -> DispatchResultWithPostInfo {
+            ensure_root(origin)?;
+            GalaxyIsOn::<T>::put(is_on);
+            Ok(().into())
+        }
+
+        #[pallet::weight(0)]
+        pub fn set_galaxy_on_gpu_threshold(origin: OriginFor<T>, gpu_threshold: u32) -> DispatchResultWithPostInfo {
+            ensure_root(origin)?;
+            GalaxyOnGPUThreshold::<T>::put(gpu_threshold);
+
+            let sys_info = Self::sys_info();
+            // NOTE: 5000张卡开启银河竞赛
+            if !Self::galaxy_is_on() && sys_info.total_gpu_num > gpu_threshold as u64 {
+                GalaxyIsOn::<T>::put(true);
+            }
             Ok(().into())
         }
 
@@ -621,16 +791,11 @@ pub mod pallet {
             machine_info.controller = new_controller.clone();
 
             // Change controller_machines
-            if let Ok(index) = old_controller_machines.binary_search(&machine_id) {
-                old_controller_machines.remove(index);
+            ItemList::rm_item(&mut old_controller_machines, &machine_id);
+            ItemList::add_item(&mut new_controller_machines, machine_id.clone());
 
-                if let Err(index) = new_controller_machines.binary_search(&machine_id) {
-                    new_controller_machines.insert(index, machine_id.clone());
-                    ControllerMachines::<T>::insert(&old_controller, old_controller_machines);
-                    ControllerMachines::<T>::insert(&new_controller, new_controller_machines);
-                }
-            }
-
+            ControllerMachines::<T>::insert(&old_controller, old_controller_machines);
+            ControllerMachines::<T>::insert(&new_controller, new_controller_machines);
             MachinesInfo::<T>::insert(machine_id.clone(), machine_info);
             Self::deposit_event(Event::MachineControllerChanged(machine_id, old_controller, new_controller));
             Ok(().into())
@@ -662,17 +827,17 @@ pub mod pallet {
 
             machine_info.machine_status = MachineStatus::StakerReportOffline(now, Box::new(MachineStatus::Online));
 
-            LiveMachine::rm_machine_id(&mut live_machines.online_machine, &machine_id);
-            LiveMachine::add_machine_id(&mut live_machines.bonding_machine, machine_id.clone());
+            ItemList::rm_item(&mut live_machines.online_machine, &machine_id);
+            ItemList::add_item(&mut live_machines.bonding_machine, machine_id.clone());
 
             Self::change_user_total_stake(machine_info.machine_stash.clone(), stake_amount, true)
                 .map_err(|_| Error::<T>::BalanceNotEnough)?;
-            UserReonlineStake::<T>::insert(
+            UserMutHardwareStake::<T>::insert(
                 &machine_info.machine_stash,
                 &machine_id,
-                UserReonlineStakeInfo { stake_amount, offline_time: now },
+                UserMutHardwareStakeInfo { stake_amount, offline_time: now },
             );
-            Self::change_pos_gpu_by_online(&machine_id, false);
+            Self::change_pos_info_by_online(&machine_info, false);
             Self::update_snap_by_online_status(machine_id.clone(), false);
             LiveMachines::<T>::put(live_machines);
             MachinesInfo::<T>::insert(&machine_id, machine_info);
@@ -708,7 +873,7 @@ pub mod pallet {
             ensure!(sig_stash_account == stash, Error::<T>::MachineStashNotEqualControllerStash);
 
             // 验证签名是否为MachineId发出
-            ensure!(Self::verify_sig(msg.clone(), sig.clone(), machine_id.clone()).is_none(), Error::<T>::BadSignature);
+            ensure!(Self::verify_sig(msg.clone(), sig.clone(), machine_id.clone()).is_some(), Error::<T>::BadSignature);
 
             // 用户绑定机器需要质押一张显卡的DBC
             let stake_amount = Self::stake_per_gpu().ok_or(Error::<T>::CalcStakeAmountFailed)?;
@@ -716,15 +881,11 @@ pub mod pallet {
             // 扣除10个Dbc作为交易手续费
             <generic_func::Module<T>>::pay_fixed_tx_fee(controller.clone()).map_err(|_| Error::<T>::PayTxFeeFailed)?;
 
-            if let Err(index) = stash_machines.total_machine.binary_search(&machine_id) {
-                stash_machines.total_machine.insert(index, machine_id.clone());
-            }
-            if let Err(index) = controller_machines.binary_search(&machine_id) {
-                controller_machines.insert(index, machine_id.clone());
-            }
+            ItemList::add_item(&mut stash_machines.total_machine, machine_id.clone());
+            ItemList::add_item(&mut controller_machines, machine_id.clone());
 
             // 添加到LiveMachine的bonding_machine字段
-            LiveMachine::add_machine_id(&mut live_machines.bonding_machine, machine_id.clone());
+            ItemList::add_item(&mut live_machines.bonding_machine, machine_id.clone());
 
             // 初始化MachineInfo, 并添加到MachinesInfo
             let machine_info = MachineInfo {
@@ -759,9 +920,7 @@ pub mod pallet {
 
             let mut stash_server_rooms = Self::stash_server_rooms(&stash);
             let new_server_room = <generic_func::Module<T>>::random_server_room();
-            if let Err(index) = stash_server_rooms.binary_search(&new_server_room) {
-                stash_server_rooms.insert(index, new_server_room);
-            }
+            ItemList::add_item(&mut stash_server_rooms, new_server_room);
 
             StashServerRooms::<T>::insert(&stash, stash_server_rooms);
             Self::deposit_event(Event::ServerRoomGenerated(controller.clone(), new_server_room));
@@ -800,15 +959,14 @@ pub mod pallet {
             }
 
             let mut live_machines = Self::live_machines();
-            if let Ok(index) = live_machines.bonding_machine.binary_search(&machine_id) {
-                live_machines.bonding_machine.remove(index);
-                if let Err(index) = live_machines.confirmed_machine.binary_search(&machine_id) {
-                    live_machines.confirmed_machine.insert(index, machine_id.clone());
-                }
-                LiveMachines::<T>::put(live_machines);
 
+            if live_machines.bonding_machine.binary_search(&machine_id).is_ok() {
+                ItemList::rm_item(&mut live_machines.bonding_machine, &machine_id);
+                ItemList::add_item(&mut live_machines.confirmed_machine, machine_id.clone());
+                LiveMachines::<T>::put(live_machines);
                 machine_info.machine_status = MachineStatus::DistributingOrder;
             }
+
             MachinesInfo::<T>::insert(&machine_id, machine_info);
 
             Self::deposit_event(Event::MachineInfoAdded(machine_id));
@@ -832,7 +990,7 @@ pub mod pallet {
             // 每卡质押按照第一次上线时计算
             let stake_need = machine_info
                 .init_stake_per_gpu
-                .checked_sub(
+                .checked_mul(
                     &machine_info.machine_info_detail.committee_upload_info.gpu_num.saturated_into::<BalanceOf<T>>(),
                 )
                 .ok_or(Error::<T>::CalcStakeAmountFailed)?;
@@ -846,9 +1004,9 @@ pub mod pallet {
             }
             machine_info.machine_status = MachineStatus::Online;
 
-            if UserReonlineStake::<T>::contains_key(&machine_info.machine_stash, &machine_id) {
+            if UserMutHardwareStake::<T>::contains_key(&machine_info.machine_stash, &machine_id) {
                 // 根据质押，奖励给这些委员会
-                let reonline_stake = Self::user_reonline_stake(&machine_info.machine_stash, &machine_id);
+                let reonline_stake = Self::user_mut_hardware_stake(&machine_info.machine_stash, &machine_id);
 
                 // 根据下线时间，惩罚stash
                 let offline_duration = now - reonline_stake.offline_time;
@@ -864,7 +1022,7 @@ pub mod pallet {
                 // 退还reonline_stake
                 Self::change_user_total_stake(machine_info.machine_stash.clone(), reonline_stake.stake_amount, false)
                     .map_err(|_| Error::<T>::ReduceStakeFailed)?;
-                UserReonlineStake::<T>::remove(&machine_info.machine_stash, &machine_id);
+                UserMutHardwareStake::<T>::remove(&machine_info.machine_stash, &machine_id);
             } else {
                 machine_info.online_height = now;
                 machine_info.reward_deadline = current_era + REWARD_DURATION;
@@ -873,13 +1031,24 @@ pub mod pallet {
             machine_info.last_online_height = now;
             machine_info.last_machine_restake = now;
 
-            Self::change_pos_gpu_by_online(&machine_id, true);
+            Self::change_pos_info_by_online(&machine_info, true);
             Self::update_snap_by_online_status(machine_id.clone(), true);
 
-            LiveMachine::rm_machine_id(&mut live_machine.fulfilling_machine, &machine_id);
-            LiveMachine::add_machine_id(&mut live_machine.online_machine, machine_id.clone());
+            ItemList::rm_item(&mut live_machine.fulfilling_machine, &machine_id);
+            ItemList::add_item(&mut live_machine.online_machine, machine_id.clone());
 
             LiveMachines::<T>::put(live_machine);
+
+            MachineRecentReward::<T>::insert(
+                &machine_id,
+                MachineRecentRewardInfo {
+                    machine_stash: machine_info.machine_stash.clone(),
+                    reward_committee_deadline: machine_info.reward_deadline,
+                    reward_committee: machine_info.reward_committee.clone(),
+                    ..Default::default()
+                },
+            );
+
             MachinesInfo::<T>::insert(&machine_id, machine_info);
             Ok(().into())
         }
@@ -889,6 +1058,7 @@ pub mod pallet {
         pub fn claim_rewards(origin: OriginFor<T>) -> DispatchResultWithPostInfo {
             let controller = ensure_signed(origin)?;
             let stash_account = Self::controller_stash(&controller).ok_or(Error::<T>::NoStashAccount)?;
+
             ensure!(StashMachines::<T>::contains_key(&stash_account), Error::<T>::NotMachineController);
             let mut stash_machine = Self::stash_machines(&stash_account);
             let can_claim = stash_machine.can_claim_reward;
@@ -934,80 +1104,47 @@ pub mod pallet {
         pub fn controller_report_online(origin: OriginFor<T>, machine_id: MachineId) -> DispatchResultWithPostInfo {
             let controller = ensure_signed(origin)?;
             let now = <frame_system::Module<T>>::block_number();
-            let current_era = Self::current_era();
 
             let mut machine_info = Self::machines_info(&machine_id);
-            let mut sys_info = Self::sys_info();
-            let mut stash_machine = Self::stash_machines(&machine_info.machine_stash);
+            ensure!(machine_info.controller == controller, Error::<T>::NotMachineController);
+
             let mut live_machine = Self::live_machines();
 
-            ensure!(machine_info.controller == controller, Error::<T>::NotMachineController);
-            ensure!(
-                now - machine_info.last_online_height > (BLOCK_PER_ERA as u32).saturated_into::<T::BlockNumber>(),
-                Error::<T>::CannotOnlineTwiceOneDay
-            );
+            let mut slash_info = OPPendingSlashInfo::default();
+            let status_before_offline: MachineStatus<T::BlockNumber, T::AccountId>;
 
-            let mut slash_amount = Zero::zero();
             // MachineStatus改为之前的状态
             match machine_info.machine_status.clone() {
                 MachineStatus::StakerReportOffline(offline_time, status) => {
                     let offline_duration = now - offline_time;
-
-                    machine_info.machine_status = *status;
-                    let gpu_num = machine_info.machine_info_detail.committee_upload_info.gpu_num as u64;
-
-                    match machine_info.machine_status {
-                        MachineStatus::Online | MachineStatus::Rented => {
-                            // Both status will change grades by online
-                            sys_info.total_gpu_num += gpu_num;
-
-                            let old_stash_grade = Self::get_stash_grades(current_era + 1, &machine_info.machine_stash);
-
-                            Self::update_snap_by_online_status(machine_id.clone(), true);
-                            Self::change_pos_gpu_by_online(&machine_id, true);
-
-                            let new_stash_grade = Self::get_stash_grades(current_era + 1, &machine_info.machine_stash);
-                            stash_machine.total_calc_points =
-                                stash_machine.total_calc_points + new_stash_grade - old_stash_grade;
-                            sys_info.total_calc_points = sys_info.total_calc_points + new_stash_grade - old_stash_grade;
-
-                            if let Err(index) = stash_machine.online_machine.binary_search(&machine_id) {
-                                stash_machine.online_machine.insert(index, machine_id.clone());
-                            }
-                            stash_machine.total_gpu_num += gpu_num;
-                        },
-                        _ => {},
-                    }
-                    match machine_info.machine_status {
+                    status_before_offline = *status;
+                    match status_before_offline.clone() {
                         MachineStatus::Online => {
                             // 如果在线超过10天，则不进行惩罚超过
                             if offline_time < machine_info.last_online_height + 28800u32.into() {
-                                // 机器在被租用状态下线，会被惩罚
-                                slash_amount = Self::slash_when_report_offline(
+                                slash_info = Self::slash_when_report_offline(
                                     machine_id.clone(),
-                                    OPSlashReason::RentedReportOffline(offline_duration),
+                                    OPSlashReason::OnlineReportOffline(offline_duration),
                                     None,
                                     None,
                                 );
                             }
                         },
                         MachineStatus::Rented => {
-                            Self::update_snap_by_rent_status(machine_id.clone(), true);
-                            Self::change_pos_gpu_by_rent(&machine_id, true);
-
                             // 机器在被租用状态下线，会被惩罚
-                            slash_amount = Self::slash_when_report_offline(
+                            slash_info = Self::slash_when_report_offline(
                                 machine_id.clone(),
                                 OPSlashReason::RentedReportOffline(offline_duration),
                                 None,
                                 None,
                             );
                         },
-                        _ => {},
+                        _ => return Ok(().into()),
                     }
                 },
-                MachineStatus::ReporterReportOffline(slash_reason, _status, reporter, committee) => {
-                    slash_amount = Self::slash_when_report_offline(
+                MachineStatus::ReporterReportOffline(slash_reason, status, reporter, committee) => {
+                    status_before_offline = *status;
+                    slash_info = Self::slash_when_report_offline(
                         machine_id.clone(),
                         slash_reason,
                         Some(reporter),
@@ -1017,26 +1154,39 @@ pub mod pallet {
                 _ => return Err(Error::<T>::MachineStatusNotAllowed.into()),
             }
 
-            SysInfo::<T>::put(sys_info); // Must before `change_user_total_stake`
-            if slash_amount != Zero::zero() {
-                Self::change_user_total_stake(machine_info.machine_stash.clone(), slash_amount, true)
-                    .map_err(|_| Error::<T>::BalanceNotEnough)?;
-            }
-
+            // machine status before offline
             machine_info.last_online_height = now;
+            machine_info.machine_status = if RentedFinished::<T>::contains_key(&machine_id) {
+                MachineStatus::Online
+            } else {
+                status_before_offline
+            };
 
-            LiveMachine::rm_machine_id(&mut live_machine.offline_machine, &machine_id);
-            match machine_info.machine_status {
-                MachineStatus::WaitingFulfill => {
-                    LiveMachine::add_machine_id(&mut live_machine.fulfilling_machine, machine_id.clone());
-                },
-                _ => {
-                    LiveMachine::add_machine_id(&mut live_machine.online_machine, machine_id.clone());
-                },
+            // Pay slash fee
+            if slash_info.slash_amount != Zero::zero() {
+                Self::change_user_total_stake(machine_info.machine_stash.clone(), slash_info.slash_amount, true)
+                    .map_err(|_| Error::<T>::BalanceNotEnough)?;
+
+                // Only after pay slash amount succeed, then make machine online.
+                let slash_id = Self::get_new_slash_id();
+                PendingSlash::<T>::insert(slash_id, slash_info);
             }
 
+            ItemList::rm_item(&mut live_machine.offline_machine, &machine_id);
+
+            Self::update_snap_by_online_status(machine_id.clone(), true);
+            Self::change_pos_info_by_online(&machine_info, true);
+            if machine_info.machine_status == MachineStatus::Rented {
+                ItemList::add_item(&mut live_machine.rented_machine, machine_id.clone());
+                Self::update_snap_by_rent_status(machine_id.clone(), true);
+                Self::change_pos_info_by_rent(&machine_info, true);
+            } else {
+                ItemList::add_item(&mut live_machine.online_machine, machine_id.clone());
+            }
+
+            // Try to remove frm rentedFinished
+            RentedFinished::<T>::remove(&machine_id);
             LiveMachines::<T>::put(live_machine);
-            StashMachines::<T>::insert(&machine_info.machine_stash, stash_machine);
             MachinesInfo::<T>::insert(&machine_id, machine_info);
 
             Self::deposit_event(Event::ControllerReportOnline(machine_id));
@@ -1059,10 +1209,13 @@ pub mod pallet {
             ensure!(now - machine_info.last_online_height >= 28800u32.into(), Error::<T>::TimeNotAllowed);
 
             // 下线机器，并退还奖励
-            Self::change_pos_gpu_by_online(&machine_id, false);
+            Self::change_pos_info_by_online(&machine_info, false);
             Self::update_snap_by_online_status(machine_id.clone(), false);
-            Self::change_user_total_stake(machine_info.machine_stash.clone(), machine_info.stake_amount, false)
-                .map_err(|_| Error::<T>::ReduceStakeFailed)?;
+            ensure!(
+                Self::change_user_total_stake(machine_info.machine_stash.clone(), machine_info.stake_amount, false)
+                    .is_ok(),
+                Error::<T>::ReduceStakeFailed
+            );
             machine_info.stake_amount = Zero::zero();
             machine_info.machine_status = MachineStatus::Exit;
 
@@ -1099,11 +1252,55 @@ pub mod pallet {
             machine_info.stake_amount = stake_need;
             machine_info.last_machine_restake = now;
             machine_info.init_stake_per_gpu = stake_per_gpu;
-            Self::change_user_total_stake(machine_info.machine_stash.clone(), extra_stake, false)
-                .map_err(|_| Error::<T>::ReduceStakeFailed)?;
+            ensure!(
+                Self::change_user_total_stake(machine_info.machine_stash.clone(), extra_stake, false).is_ok(),
+                Error::<T>::ReduceStakeFailed
+            );
 
             MachinesInfo::<T>::insert(&machine_id, machine_info.clone());
             Self::deposit_event(Event::MachineRestaked(machine_id, old_stake, machine_info.stake_amount));
+            Ok(().into())
+        }
+
+        #[pallet::weight(10000)]
+        pub fn apply_slash_review(
+            origin: OriginFor<T>,
+            slash_id: SlashId,
+            reason: Vec<u8>,
+        ) -> DispatchResultWithPostInfo {
+            let controller = ensure_signed(origin)?;
+            let now = <frame_system::Module<T>>::block_number();
+
+            let slash_info = Self::pending_slash(slash_id);
+            let machine_info = Self::machines_info(&slash_info.machine_id);
+            let online_stake_params = Self::online_stake_params2().ok_or(Error::<T>::GetReonlineStakeFailed)?;
+
+            ensure!(machine_info.controller == controller, Error::<T>::NotMachineController);
+            ensure!(slash_info.slash_exec_time > now, Error::<T>::ExpiredSlash);
+
+            // 补交质押
+            ensure!(
+                Self::change_user_total_stake(
+                    machine_info.machine_stash.clone(),
+                    online_stake_params.slash_review_stake,
+                    true,
+                )
+                .is_ok(),
+                Error::<T>::BalanceNotEnough
+            );
+
+            PendingSlashReview::<T>::insert(
+                slash_id,
+                OPPendingSlashReviewInfo {
+                    applicant: controller,
+                    staked_amount: online_stake_params.slash_review_stake,
+                    apply_time: now,
+                    expire_time: slash_info.slash_exec_time,
+                    reason,
+                },
+            );
+
+            Self::deposit_event(Event::ApplySlashReview(slash_id));
             Ok(().into())
         }
 
@@ -1116,8 +1313,8 @@ pub mod pallet {
 
             Self::change_user_total_stake(slash_info.slash_who.clone(), slash_info.slash_amount, false)
                 .map_err(|_| Error::<T>::ReduceStakeFailed)?;
-            PendingSlash::<T>::remove(slash_id);
 
+            PendingSlash::<T>::remove(slash_id);
             Self::deposit_event(Event::SlashCanceled(slash_id, slash_info.slash_who, slash_info.slash_amount));
             Ok(().into())
         }
@@ -1145,6 +1342,8 @@ pub mod pallet {
         MachineExit(MachineId),
         // Slash_who, reward_who, reward_amount
         SlashAndReward(T::AccountId, T::AccountId, BalanceOf<T>, OPSlashReason<T::BlockNumber>),
+        ApplySlashReview(SlashId),
+        SlashExecuted(T::AccountId, MachineId, BalanceOf<T>),
     }
 
     #[pallet::error]
@@ -1168,7 +1367,6 @@ pub mod pallet {
         SigMachineIdNotEqualBondedMachineId,
         TelecomIsNull,
         MachineStatusNotAllowed,
-        CannotOnlineTwiceOneDay,
         ServerRoomNotFound,
         NotMachineStash,
         TooFastToReStake,
@@ -1177,372 +1375,11 @@ pub mod pallet {
         GetReonlineStakeFailed,
         SlashIdNotExist,
         TimeNotAllowed,
+        ExpiredSlash,
     }
 }
 
 impl<T: Config> Pallet<T> {
-    // TODO: 主动惩罚超过下线阈值的机器
-    fn check_offline_machine_duration() {
-        let live_machine = Self::live_machines();
-
-        for a_machine in live_machine.offline_machine {
-            let machine_info = Self::machines_info(&a_machine);
-            match machine_info.machine_status {
-                MachineStatus::StakerReportOffline(offline_time, status) => {},
-                MachineStatus::ReporterReportOffline(offline_reason, status, reporter, committee) => {},
-                _ => continue,
-            }
-        }
-    }
-
-    // Return slashed amount when slash is executed
-    fn slash_when_report_offline(
-        machine_id: MachineId,
-        slash_reason: OPSlashReason<T::BlockNumber>,
-        reporter: Option<T::AccountId>,
-        committee: Option<Vec<T::AccountId>>,
-    ) -> BalanceOf<T> {
-        let machine_info = Self::machines_info(&machine_id);
-        let now = <frame_system::Module<T>>::block_number();
-        match slash_reason {
-            // 算工主动报告被租用的机器，主动下线
-            OPSlashReason::RentedReportOffline(duration) => {
-                let duration = duration.saturated_into::<u64>();
-                match duration {
-                    0 => return Zero::zero(),
-                    // 下线不超过7分钟
-                    1..=14 => {
-                        // 扣除2%质押币。100%进入国库。
-                        return Self::add_offline_slash(2, machine_id, None, None, slash_reason)
-                    },
-                    // 不超过48小时
-                    15..=5760 => {
-                        // 扣除4%质押币。100%进入国库
-                        return Self::add_offline_slash(4, machine_id, None, None, slash_reason)
-                    },
-                    // 不超过120小时
-                    5761..=14400 => {
-                        // 扣除30%质押币，10%给到用户，90%进入国库
-                        return Self::add_offline_slash(
-                            30,
-                            machine_id,
-                            machine_info.last_machine_renter,
-                            None,
-                            slash_reason,
-                        )
-                    },
-                    // 超过120小时
-                    _ => {
-                        // 扣除50%押金。10%给到用户，90%进入国库
-                        return Self::add_offline_slash(
-                            50,
-                            machine_id,
-                            machine_info.last_machine_renter,
-                            None,
-                            slash_reason,
-                        )
-                    },
-                }
-            },
-            // 算工主动报告在线的机器，主动下线
-            OPSlashReason::OnlineReportOffline(duration) => {
-                // 判断是否已经下线十天，如果是，则不进行惩罚，仅仅下线处理
-                // NOTE: 此时，machine_info.last_online_height还未改变
-                if now > 28800u32.saturated_into::<T::BlockNumber>() + duration + machine_info.last_online_height {
-                    return Zero::zero()
-                }
-                let duration = duration.saturated_into::<u64>();
-                match duration {
-                    0 => return Zero::zero(),
-                    // 下线不超过7分钟
-                    1..=14 => {
-                        // 扣除2%质押币，质押币全部进入国库。
-                        return Self::add_offline_slash(2, machine_id, None, None, slash_reason)
-                    },
-                    // 下线不超过48小时
-                    15..=5760 => {
-                        // 扣除4%质押币，质押币全部进入国库
-                        return Self::add_offline_slash(4, machine_id, None, None, slash_reason)
-                    },
-                    // 不超过240小时
-                    5761..=28800 => {
-                        // 扣除30%质押币，质押币全部进入国库
-                        return Self::add_offline_slash(30, machine_id, None, None, slash_reason)
-                    },
-                    _ => {
-                        // TODO: 如果机器从首次上线时间起超过365天，剩下20%押金可以申请退回。
-
-                        // 扣除80%质押币。质押币全部进入国库。
-                        return Self::add_offline_slash(80, machine_id, None, None, slash_reason)
-                    },
-                }
-            },
-            // 机器处于租用状态，无法访问，这种情况下，reporter == renter
-            OPSlashReason::RentedInaccessible(duration) => {
-                let duration = duration.saturated_into::<u64>();
-                match duration {
-                    0 => return Zero::zero(),
-                    // 不超过7分钟
-                    1..=14 => {
-                        // 扣除4%质押币。10%给验证人，90%进入国库
-                        return Self::add_offline_slash(4, machine_id, None, committee, slash_reason)
-                    },
-                    // 不超过48小时
-                    15..=5760 => {
-                        // 扣除8%质押币。10%给验证人，90%进入国库
-                        return Self::add_offline_slash(8, machine_id, None, committee, slash_reason)
-                    },
-                    // 不超过120小时
-                    5761..=14400 => {
-                        // 扣除60%质押币。10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(60, machine_id, reporter, committee, slash_reason)
-                    },
-                    // 超过120小时
-                    _ => {
-                        // 扣除100%押金。10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(100, machine_id, reporter, committee, slash_reason)
-                    },
-                }
-            },
-            // 机器处于租用状态，机器出现故障
-            OPSlashReason::RentedHardwareMalfunction(duration) => {
-                let duration = duration.saturated_into::<u64>();
-                match duration {
-                    0 => return Zero::zero(),
-                    //不超过4小时
-                    1..=480 => {
-                        // 扣除6%质押币。10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(6, machine_id, reporter, committee, slash_reason)
-                    },
-                    // 不超过24小时
-                    481..=2880 => {
-                        // 扣除12%质押币。10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(12, machine_id, reporter, committee, slash_reason)
-                    },
-                    // 不超过48小时
-                    2881..=5760 => {
-                        // 扣除16%质押币。10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(16, machine_id, reporter, committee, slash_reason)
-                    },
-                    // 不超过120小时
-                    5761..=14400 => {
-                        // 扣除60%质押币。10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(60, machine_id, reporter, committee, slash_reason)
-                    },
-                    _ => {
-                        // 扣除100%押金，10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(100, machine_id, reporter, committee, slash_reason)
-                    },
-                }
-            },
-            // 机器处于租用状态，机器硬件造假
-            OPSlashReason::RentedHardwareCounterfeit(duration) => {
-                let duration = duration.saturated_into::<u64>();
-                match duration {
-                    0 => return Zero::zero(),
-                    // 下线不超过4小时
-                    1..=480 => {
-                        // 扣除12%质押币。10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(12, machine_id, reporter, committee, slash_reason)
-                    },
-                    // 不超过24小时
-                    481..=2880 => {
-                        // 扣除24%质押币。10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(24, machine_id, reporter, committee, slash_reason)
-                    },
-                    // 不超过48小时
-                    2881..=5760 => {
-                        // 扣除32%质押币。10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(32, machine_id, reporter, committee, slash_reason)
-                    },
-                    // 不超过120小时
-                    5761..=14400 => {
-                        // 扣除60%质押币。10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(60, machine_id, reporter, committee, slash_reason)
-                    },
-                    _ => {
-                        // 扣除100%押金，10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(100, machine_id, reporter, committee, slash_reason)
-                    },
-                }
-            },
-            // 机器在线，被举报无法租用
-            OPSlashReason::OnlineRentFailed(duration) => {
-                let duration = duration.saturated_into::<u64>();
-                match duration {
-                    0 => return Zero::zero(),
-                    1..=480 => {
-                        // 扣除6%质押币。10%给到用户，20%给到验证人，50%进入国库
-                        return Self::add_offline_slash(6, machine_id, reporter, committee, slash_reason)
-                    },
-                    481..=2880 => {
-                        // 扣除12%质押币。10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(12, machine_id, reporter, committee, slash_reason)
-                    },
-                    2881..=5760 => {
-                        // 扣除16%质押币。10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(16, machine_id, reporter, committee, slash_reason)
-                    },
-                    5761..=14400 => {
-                        // 扣除60%质押币。10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(60, machine_id, reporter, committee, slash_reason)
-                    },
-                    _ => {
-                        // 扣除100%押金，10%给到用户，20%给到验证人，70%进入国库
-                        return Self::add_offline_slash(100, machine_id, reporter, committee, slash_reason)
-                    },
-                }
-            },
-            _ => return Zero::zero(),
-        }
-    }
-
-    fn add_offline_slash(
-        slash_percent: u32,
-        machine_id: MachineId,
-        reporter: Option<T::AccountId>,
-        committee: Option<Vec<T::AccountId>>,
-        slash_reason: OPSlashReason<T::BlockNumber>,
-    ) -> BalanceOf<T> {
-        let now = <frame_system::Module<T>>::block_number();
-        let machine_info = Self::machines_info(&machine_id);
-        let slash_amount = Perbill::from_rational_approximation(slash_percent, 100) * machine_info.stake_amount;
-
-        let slash_id = Self::get_new_slash_id();
-        let slash_info = OPPendingSlashInfo {
-            slash_who: machine_info.machine_stash,
-            machine_id,
-            slash_time: now,
-            slash_amount,
-            slash_exec_time: now + (2880u32 * 2).saturated_into::<T::BlockNumber>(),
-            reward_to_reporter: reporter,
-            reward_to_committee: committee,
-            slash_reason,
-        };
-
-        PendingSlash::<T>::insert(slash_id, slash_info);
-        slash_amount
-    }
-
-    // FIXME: refa, and should not do transfer but unreserve
-    // 惩罚掉机器押金，如果执行惩罚后机器押金不够，则状态变为补充质押
-    fn do_slash_deposit(slash_info: &OPPendingSlashInfo<T::AccountId, T::BlockNumber, BalanceOf<T>>) {
-        let machine_info = Self::machines_info(&slash_info.machine_id);
-
-        if <T as pallet::Config>::Currency::can_slash(&machine_info.machine_stash, slash_info.slash_amount) {
-            let (imbalance, _missing) =
-                <T as pallet::Config>::Currency::slash(&machine_info.machine_stash, slash_info.slash_amount);
-
-            <T as pallet::Config>::Slash::on_unbalanced(imbalance);
-        }
-
-        // 根据比例，分配slash_amoun
-        let (slash_to_treasury, reward_to_reporter, reward_to_committee) = {
-            let percent_10 = Perbill::from_rational_approximation(10u32, 100u32);
-            let percent_20 = Perbill::from_rational_approximation(20u32, 100u32);
-
-            if slash_info.reward_to_reporter.is_some() && slash_info.reward_to_committee.is_none() {
-                let reward_to_reporter = percent_10 * slash_info.slash_amount;
-                let slash_to_treasury = slash_info.slash_amount - reward_to_reporter;
-                (slash_to_treasury, reward_to_reporter, Zero::zero())
-            } else if slash_info.reward_to_reporter.is_some() && slash_info.reward_to_committee.is_some() {
-                let reward_to_reporter = percent_10 * slash_info.slash_amount;
-                let reward_to_committee = percent_20 * slash_info.slash_amount;
-                let slash_to_treasury = slash_info.slash_amount - reward_to_reporter - reward_to_committee;
-                (slash_to_treasury, reward_to_reporter, reward_to_committee)
-            } else {
-                (slash_info.slash_amount, Zero::zero(), Zero::zero())
-            }
-        };
-
-        // 奖励给委员会的立即给委员会
-        if !reward_to_reporter.is_zero() && slash_info.reward_to_reporter.is_some() {
-            let _ = <T as pallet::Config>::Currency::transfer(
-                &machine_info.machine_stash,
-                &slash_info.reward_to_reporter.as_ref().unwrap(),
-                reward_to_reporter,
-                KeepAlive,
-            );
-        }
-
-        // 奖励给报告人的立即给报告人
-        if !reward_to_committee.is_zero() && slash_info.reward_to_committee.is_some() {
-            let committees = slash_info.reward_to_committee.as_ref().unwrap();
-            let reward_each_committee_get =
-                Perbill::from_rational_approximation(1u32, committees.len() as u32) * reward_to_committee;
-            for a_committee in committees {
-                let _ = <T as pallet::Config>::Currency::transfer(
-                    &machine_info.machine_stash,
-                    &a_committee,
-                    reward_each_committee_get,
-                    KeepAlive,
-                );
-            }
-        }
-
-        // 执行惩罚
-        if <T as pallet::Config>::Currency::can_slash(&machine_info.machine_stash, slash_to_treasury) {
-            let (imbalance, _missing) =
-                <T as pallet::Config>::Currency::slash(&machine_info.machine_stash, slash_to_treasury);
-            // Self::deposit_event(Event::Slash(machine_info.machine_stash.clone(), slash_amount, SlashReason::));
-            <T as pallet::Config>::Slash::on_unbalanced(imbalance);
-        }
-    }
-
-    fn get_new_slash_id() -> u64 {
-        let slash_id = Self::next_slash_id();
-
-        if slash_id == u64::MAX {
-            NextSlashId::<T>::put(0);
-        } else {
-            NextSlashId::<T>::put(slash_id + 1);
-        };
-
-        return slash_id
-    }
-
-    fn do_pending_slash() -> Result<(), ()> {
-        // 获得所有slashID
-        let now = <frame_system::Module<T>>::block_number();
-        let all_slash_id = <PendingSlash<T> as IterableStorageMap<u64, _>>::iter()
-            .map(|(slash_id, _)| slash_id)
-            .collect::<Vec<_>>();
-
-        // 判断是否已经超过2天，如果超过，则执行惩罚
-        for slash_id in all_slash_id {
-            let slash_info = Self::pending_slash(slash_id);
-            if now < slash_info.slash_exec_time {
-                continue
-            }
-
-            match slash_info.slash_reason {
-                OPSlashReason::CommitteeRefusedOnline | OPSlashReason::CommitteeRefusedMutHardware => {
-                    Self::slash_and_reward(
-                        slash_info.slash_who,
-                        slash_info.slash_amount,
-                        slash_info.slash_reason,
-                        slash_info.reward_to_committee.unwrap_or_default(),
-                    )?;
-                },
-                _ => {
-                    Self::do_slash_deposit(&slash_info);
-                    continue
-                },
-            }
-
-            PendingSlash::<T>::remove(slash_id);
-        }
-
-        Ok(())
-    }
-
-    // For upgrade
-    pub fn get_all_machine_id() -> Vec<MachineId> {
-        <MachinesInfo<T> as IterableStorageMap<MachineId, _>>::iter()
-            .map(|(machine_id, _)| machine_id)
-            .collect::<Vec<_>>()
-    }
-
     /// 下架机器
     fn machine_offline(machine_id: MachineId, machine_status: MachineStatus<T::BlockNumber, T::AccountId>) {
         let mut machine_info = Self::machines_info(&machine_id);
@@ -1550,15 +1387,15 @@ impl<T: Config> Pallet<T> {
 
         if let MachineStatus::Rented = machine_info.machine_status {
             Self::update_snap_by_rent_status(machine_id.clone(), false);
-            Self::change_pos_gpu_by_rent(&machine_id, false);
+            Self::change_pos_info_by_rent(&machine_info, false);
         }
 
         // When offline, pos_info will be removed
-        Self::change_pos_gpu_by_online(&machine_id, false);
+        Self::change_pos_info_by_online(&machine_info, false);
         Self::update_snap_by_online_status(machine_id.clone(), false);
 
-        LiveMachine::rm_machine_id(&mut live_machine.online_machine, &machine_id);
-        LiveMachine::add_machine_id(&mut live_machine.offline_machine, machine_id.clone());
+        ItemList::rm_item(&mut live_machine.online_machine, &machine_id);
+        ItemList::add_item(&mut live_machine.offline_machine, machine_id.clone());
 
         // After re-online, machine status is same as former
         machine_info.machine_status = machine_status;
@@ -1567,206 +1404,51 @@ impl<T: Config> Pallet<T> {
         MachinesInfo::<T>::insert(&machine_id, machine_info);
     }
 
-    /// 特定位置GPU上线/下线
-    // - Writes:
-    // PosGPUInfo, ServerRoomMachines
-    fn change_pos_gpu_by_online(machine_id: &MachineId, is_online: bool) {
-        let machine_info = Self::machines_info(&machine_id);
-
-        let longitude = machine_info.machine_info_detail.staker_customize_info.longitude.clone();
-        let latitude = machine_info.machine_info_detail.staker_customize_info.latitude.clone();
-        let gpu_num = machine_info.machine_info_detail.committee_upload_info.gpu_num;
+    /// GPU online/offline
+    // - Writes: PosGPUInfo
+    // NOTE: pos_gpu_info only record actual machine grades(reward grade not included)
+    fn change_pos_info_by_online(
+        machine_info: &MachineInfo<T::AccountId, T::BlockNumber, BalanceOf<T>>,
+        is_online: bool,
+    ) {
+        let longitude = &machine_info.machine_info_detail.staker_customize_info.longitude;
+        let latitude = &machine_info.machine_info_detail.staker_customize_info.latitude;
+        let gpu_num = machine_info.machine_info_detail.committee_upload_info.gpu_num as u64;
         let calc_point = machine_info.machine_info_detail.committee_upload_info.calc_point;
 
-        let mut pos_gpu_info = Self::pos_gpu_info(longitude.clone(), latitude.clone());
+        let mut pos_gpu_info = Self::pos_gpu_info(longitude, latitude);
 
         if is_online {
-            pos_gpu_info.online_gpu += gpu_num as u64;
+            pos_gpu_info.online_gpu += gpu_num;
             pos_gpu_info.online_gpu_calc_points += calc_point;
         } else {
-            pos_gpu_info.online_gpu -= gpu_num as u64;
-            pos_gpu_info.offline_gpu += gpu_num as u64;
-            pos_gpu_info.online_gpu_calc_points -= calc_point;
+            pos_gpu_info.online_gpu = pos_gpu_info.online_gpu.checked_sub(gpu_num).unwrap_or_default();
+            pos_gpu_info.offline_gpu += gpu_num;
+            pos_gpu_info.online_gpu_calc_points =
+                pos_gpu_info.online_gpu_calc_points.checked_sub(calc_point).unwrap_or_default();
         }
 
-        let server_room = machine_info.machine_info_detail.staker_customize_info.server_room;
-        let mut server_room_machines = Self::server_room_machines(server_room).unwrap_or_default();
-
-        if is_online {
-            if let Err(index) = server_room_machines.binary_search(machine_id) {
-                server_room_machines.insert(index, machine_id.to_vec());
-            }
-        } else {
-            if let Ok(index) = server_room_machines.binary_search(machine_id) {
-                server_room_machines.remove(index);
-            }
-        }
-
-        ServerRoomMachines::<T>::insert(server_room, server_room_machines);
         PosGPUInfo::<T>::insert(longitude, latitude, pos_gpu_info);
     }
 
-    /// 特定位置GPU被租用/租用结束
-    fn change_pos_gpu_by_rent(machine_id: &MachineId, is_rented: bool) {
-        let machine_info = Self::machines_info(machine_id);
-
-        let longitude = machine_info.machine_info_detail.staker_customize_info.longitude.clone();
-        let latitude = machine_info.machine_info_detail.staker_customize_info.latitude.clone();
-        let gpu_num = machine_info.machine_info_detail.committee_upload_info.gpu_num;
+    /// GPU rented/surrender
+    // - Writes: PosGPUInfo
+    fn change_pos_info_by_rent(
+        machine_info: &MachineInfo<T::AccountId, T::BlockNumber, BalanceOf<T>>,
+        is_rented: bool,
+    ) {
+        let longitude = &machine_info.machine_info_detail.staker_customize_info.longitude;
+        let latitude = &machine_info.machine_info_detail.staker_customize_info.latitude;
+        let gpu_num = machine_info.machine_info_detail.committee_upload_info.gpu_num as u64;
 
         let mut pos_gpu_info = Self::pos_gpu_info(longitude.clone(), latitude.clone());
         if is_rented {
-            pos_gpu_info.rented_gpu += gpu_num as u64;
+            pos_gpu_info.rented_gpu += gpu_num;
         } else {
-            pos_gpu_info.rented_gpu -= gpu_num as u64;
+            pos_gpu_info.rented_gpu = pos_gpu_info.rented_gpu.checked_sub(gpu_num).unwrap_or_default();
         }
 
         PosGPUInfo::<T>::insert(longitude, latitude, pos_gpu_info);
-    }
-
-    // 接收到[u8; 64] -> str -> [u8; 32] -> pubkey
-    fn verify_sig(msg: Vec<u8>, sig: Vec<u8>, account: Vec<u8>) -> Option<()> {
-        let signature = sp_core::sr25519::Signature::try_from(&sig[..]).ok()?;
-        // let public = Self::get_public_from_str(&account)?;
-
-        let pubkey_str = str::from_utf8(&account).ok()?;
-        let pubkey_hex: Result<Vec<u8>, _> =
-            (0..pubkey_str.len()).step_by(2).map(|i| u8::from_str_radix(&pubkey_str[i..i + 2], 16)).collect();
-        let pubkey_hex = pubkey_hex.ok()?;
-
-        let account_id32: [u8; 32] = pubkey_hex.try_into().ok()?;
-        let public = sp_core::sr25519::Public::from_slice(&account_id32);
-
-        signature.verify(&msg[..], &public.into()).then(|| ())
-    }
-
-    // 参考：primitives/core/src/crypto.rs: impl Ss58Codec for AccountId32
-    // from_ss58check_with_version
-    fn get_accountid32(addr: &Vec<u8>) -> Option<[u8; 32]> {
-        let mut data: [u8; 35] = [0; 35];
-
-        let length = bs58::decode(addr).into(&mut data).ok()?;
-        if length != 35 {
-            return None
-        }
-
-        let (_prefix_len, _ident) = match data[0] {
-            0..=63 => (1, data[0] as u16),
-            _ => return None,
-        };
-
-        let account_id32: [u8; 32] = data[1..33].try_into().ok()?;
-        Some(account_id32)
-    }
-
-    fn get_account_from_str(addr: &Vec<u8>) -> Option<T::AccountId> {
-        let account_id32: [u8; 32] = Self::get_accountid32(addr)?;
-        T::AccountId::decode(&mut &account_id32[..]).ok()
-    }
-
-    fn _get_public_from_str(addr: &Vec<u8>) -> Option<sp_core::sr25519::Public> {
-        let account_id32: [u8; 32] = Self::get_accountid32(addr)?;
-        Some(sp_core::sr25519::Public::from_slice(&account_id32))
-    }
-
-    // 质押DBC机制：[0, 10000] GPU: 100000 DBC per GPU
-    // (10000, +) -> min( 100000 * 10000 / (10000 + n), 5w RMB DBC
-    pub fn stake_per_gpu() -> Option<BalanceOf<T>> {
-        let sys_info = Self::sys_info();
-        let online_stake_params = Self::online_stake_params()?;
-
-        let dbc_stake_per_gpu = if sys_info.total_gpu_num > 10_000 {
-            Perbill::from_rational_approximation(10_000u64, sys_info.total_gpu_num) *
-                online_stake_params.online_stake_per_gpu
-        } else {
-            online_stake_params.online_stake_per_gpu
-        };
-
-        let stake_limit = T::DbcPrice::get_dbc_amount_by_value(online_stake_params.online_stake_usd_limit)?;
-        Some(dbc_stake_per_gpu.min(stake_limit)) // .checked_mul(&gpu_num.saturated_into::<BalanceOf<T>>())
-    }
-
-    /// 根据GPU数量和该机器算力点数，计算该机器相比标准配置的租用价格
-    pub fn calc_machine_price(machine_point: u64) -> Option<u64> {
-        let standard_gpu_point_price = Self::standard_gpu_point_price()?;
-        standard_gpu_point_price
-            .gpu_price
-            .checked_mul(machine_point)?
-            .checked_mul(10_000)?
-            .checked_div(standard_gpu_point_price.gpu_point)?
-            .checked_div(10_000)
-    }
-
-    /// TODO: 计算当前Era在线奖励数量
-    fn current_era_reward() -> Option<BalanceOf<T>> {
-        let current_era = Self::current_era() as u64;
-        let reward_start_era = Self::reward_start_era()? as u64;
-
-        if current_era < reward_start_era {
-            return None
-        }
-
-        let era_duration = current_era - reward_start_era;
-
-        let phase_index = if era_duration < 30 {
-            0
-        } else if era_duration < 30 + 730 {
-            1
-        } else if era_duration < 30 + 730 + 270 {
-            2
-        } else if era_duration < 30 + 730 + 270 + 1825 {
-            3
-        } else {
-            4
-        };
-
-        Self::phase_n_reward_per_era(phase_index)
-    }
-
-    fn slash_and_reward(
-        slash_who: T::AccountId,
-        slash_amount: BalanceOf<T>,
-        slash_reason: OPSlashReason<T::BlockNumber>,
-        reward_to: Vec<T::AccountId>,
-    ) -> Result<(), ()> {
-        let mut stash_stake = Self::stash_stake(&slash_who);
-        let mut sys_info = Self::sys_info();
-
-        sys_info.total_stake = sys_info.total_stake.checked_sub(&slash_amount).ok_or(())?;
-        stash_stake = stash_stake.checked_sub(&slash_amount).ok_or(())?;
-
-        let mut left_reward = slash_amount;
-        let reward_each_get = Perbill::from_rational_approximation(1u32, reward_to.len() as u32) * slash_amount;
-
-        ensure!(<T as pallet::Config>::Currency::can_slash(&slash_who, slash_amount), ());
-
-        if reward_to.len() == 0 {
-            let (imbalance, _missing) = <T as pallet::Config>::Currency::slash(&slash_who, slash_amount);
-            <T as pallet::Config>::Slash::on_unbalanced(imbalance);
-            Self::deposit_event(Event::Slash(slash_who.clone(), slash_amount, slash_reason));
-        } else {
-            for a_committee in reward_to.clone() {
-                let a_slash = if left_reward >= reward_each_get { reward_each_get } else { left_reward };
-                <T as pallet::Config>::Currency::repatriate_reserved(
-                    &slash_who,
-                    &a_committee,
-                    a_slash,
-                    BalanceStatus::Free,
-                )
-                .map_err(|_| ())?;
-                Self::deposit_event(Event::SlashAndReward(
-                    slash_who.clone(),
-                    a_committee,
-                    a_slash,
-                    slash_reason.clone(),
-                ));
-                left_reward -= a_slash;
-            }
-        }
-
-        StashStake::<T>::insert(&slash_who, stash_stake);
-        SysInfo::<T>::put(sys_info);
-        Ok(())
     }
 
     fn change_user_total_stake(who: T::AccountId, amount: BalanceOf<T>, is_add: bool) -> Result<(), ()> {
@@ -1796,17 +1478,9 @@ impl<T: Config> Pallet<T> {
         Ok(())
     }
 
-    fn reward_reonline_committee(
-        who: T::AccountId,
-        amount: BalanceOf<T>,
-        committee: Vec<T::AccountId>,
-    ) -> Result<(), ()> {
-        Self::slash_and_reward(who, amount, OPSlashReason::ReonlineShouldReward, committee)
-    }
-
     // 获取下一Era stash grade即为当前Era stash grade
     fn get_stash_grades(era_index: EraIndex, stash: &T::AccountId) -> u64 {
-        let next_era_stash_snapshot = Self::eras_stash_points(era_index).unwrap_or_default();
+        let next_era_stash_snapshot = Self::eras_stash_points2(era_index);
 
         if let Some(stash_snapshot) = next_era_stash_snapshot.staker_statistic.get(stash) {
             return stash_snapshot.total_grades().unwrap_or_default()
@@ -1825,17 +1499,18 @@ impl<T: Config> Pallet<T> {
         let machine_base_info = machine_info.machine_info_detail.committee_upload_info.clone();
         let current_era = Self::current_era();
 
-        let mut current_era_stash_snapshot = Self::eras_stash_points(current_era).unwrap();
-        let mut next_era_stash_snapshot = Self::eras_stash_points(current_era + 1).unwrap();
-        let mut current_era_machine_snapshot = Self::eras_machine_points(current_era).unwrap();
-        let mut next_era_machine_snapshot = Self::eras_machine_points(current_era + 1).unwrap();
+        let mut current_era_stash_snap = Self::eras_stash_points2(current_era);
+        let mut next_era_stash_snap = Self::eras_stash_points2(current_era + 1);
+        let mut current_era_machine_snap = Self::eras_machine_points2(current_era);
+        let mut next_era_machine_snap = Self::eras_machine_points2(current_era + 1);
 
         let mut stash_machine = Self::stash_machines(&machine_info.machine_stash);
         let mut sys_info = Self::sys_info();
 
         let old_stash_grade = Self::get_stash_grades(current_era + 1, &machine_info.machine_stash);
+        let current_era_is_online = current_era_machine_snap.contains_key(&machine_id);
 
-        next_era_stash_snapshot.change_machine_online_status(
+        next_era_stash_snap.change_machine_online_status(
             machine_info.machine_stash.clone(),
             machine_info.machine_info_detail.committee_upload_info.gpu_num as u64,
             machine_info.machine_info_detail.committee_upload_info.calc_point,
@@ -1843,7 +1518,7 @@ impl<T: Config> Pallet<T> {
         );
 
         if is_online {
-            next_era_machine_snapshot.insert(
+            next_era_machine_snap.insert(
                 machine_id.clone(),
                 MachineGradeStatus {
                     basic_grade: machine_info.machine_info_detail.committee_upload_info.calc_point,
@@ -1851,37 +1526,34 @@ impl<T: Config> Pallet<T> {
                 },
             );
 
-            if let Err(index) = stash_machine.online_machine.binary_search(&machine_id) {
-                stash_machine.online_machine.insert(index, machine_id.clone());
-            }
+            ItemList::add_item(&mut stash_machine.online_machine, machine_id.clone());
             stash_machine.total_gpu_num += machine_base_info.gpu_num as u64;
             sys_info.total_gpu_num += machine_base_info.gpu_num as u64;
         } else {
-            // NOTE: 24小时内，不能下线后再次下线。因为下线会清空当日得分记录，
-            // 一天内再次下线会造成再次清空
-            current_era_stash_snapshot.change_machine_online_status(
-                machine_info.machine_stash.clone(),
-                machine_info.machine_info_detail.committee_upload_info.gpu_num as u64,
-                machine_info.machine_info_detail.committee_upload_info.calc_point,
-                is_online,
-            );
-            current_era_machine_snapshot.remove(&machine_id);
-            next_era_machine_snapshot.remove(&machine_id);
-
-            if let Ok(index) = stash_machine.online_machine.binary_search(&machine_id) {
-                stash_machine.online_machine.remove(index);
+            if current_era_is_online {
+                // NOTE: 24小时内，不能下线后再次下线。因为下线会清空当日得分记录，
+                // 一天内再次下线会造成再次清空
+                current_era_stash_snap.change_machine_online_status(
+                    machine_info.machine_stash.clone(),
+                    machine_info.machine_info_detail.committee_upload_info.gpu_num as u64,
+                    machine_info.machine_info_detail.committee_upload_info.calc_point,
+                    is_online,
+                );
+                current_era_machine_snap.remove(&machine_id);
+                next_era_machine_snap.remove(&machine_id);
             }
 
+            ItemList::rm_item(&mut stash_machine.online_machine, &machine_id);
             stash_machine.total_gpu_num -= machine_base_info.gpu_num as u64;
             sys_info.total_gpu_num -= machine_base_info.gpu_num as u64;
         }
 
         // 机器上线或者下线都会影响下一era得分，而只有下线才影响当前era得分
-        ErasStashPoints::<T>::insert(current_era + 1, next_era_stash_snapshot);
-        ErasMachinePoints::<T>::insert(current_era + 1, next_era_machine_snapshot);
+        ErasStashPoints::<T>::insert(current_era + 1, next_era_stash_snap);
+        ErasMachinePoints::<T>::insert(current_era + 1, next_era_machine_snap);
         if !is_online {
-            ErasStashPoints::<T>::insert(current_era, current_era_stash_snapshot);
-            ErasMachinePoints::<T>::insert(current_era, current_era_machine_snapshot);
+            ErasStashPoints::<T>::insert(current_era, current_era_stash_snap);
+            ErasMachinePoints::<T>::insert(current_era, current_era_machine_snap);
         }
 
         let new_stash_grade = Self::get_stash_grades(current_era + 1, &machine_info.machine_stash);
@@ -1889,7 +1561,7 @@ impl<T: Config> Pallet<T> {
         sys_info.total_calc_points = sys_info.total_calc_points + new_stash_grade - old_stash_grade;
 
         // NOTE: 5000张卡开启银河竞赛
-        if !Self::galaxy_is_on() && sys_info.total_gpu_num > 5000 {
+        if !Self::galaxy_is_on() && sys_info.total_gpu_num > Self::galaxy_on_gpu_threshold() as u64 {
             GalaxyIsOn::<T>::put(true);
         }
 
@@ -1910,13 +1582,21 @@ impl<T: Config> Pallet<T> {
         let machine_info = Self::machines_info(&machine_id);
         let current_era = Self::current_era();
 
-        let mut current_era_stash_snap = Self::eras_stash_points(current_era).unwrap_or_default();
-        let mut next_era_stash_snap = Self::eras_stash_points(current_era + 1).unwrap_or_default();
-        let mut current_era_machine_snap = Self::eras_machine_points(current_era).unwrap_or_default();
-        let mut next_era_machine_snap = Self::eras_machine_points(current_era + 1).unwrap_or_default();
+        let mut current_era_stash_snap = Self::eras_stash_points2(current_era);
+        let mut next_era_stash_snap = Self::eras_stash_points2(current_era + 1);
+        let mut current_era_machine_snap = Self::eras_machine_points2(current_era);
+        let mut next_era_machine_snap = Self::eras_machine_points2(current_era + 1);
 
         let mut stash_machine = Self::stash_machines(&machine_info.machine_stash);
         let mut sys_info = Self::sys_info();
+
+        let current_era_is_online = current_era_machine_snap.contains_key(&machine_id);
+        let current_era_is_rented = if current_era_is_online {
+            let machine_snap = current_era_machine_snap.get(&machine_id).unwrap();
+            machine_snap.is_rented
+        } else {
+            false
+        };
 
         let old_stash_grade = Self::get_stash_grades(current_era + 1, &machine_info.machine_stash);
 
@@ -1934,11 +1614,13 @@ impl<T: Config> Pallet<T> {
         );
 
         if !is_rented {
-            current_era_stash_snap.change_machine_rent_status(
-                machine_info.machine_stash.clone(),
-                machine_info.machine_info_detail.committee_upload_info.calc_point,
-                is_rented,
-            );
+            if current_era_is_rented {
+                current_era_stash_snap.change_machine_rent_status(
+                    machine_info.machine_stash.clone(),
+                    machine_info.machine_info_detail.committee_upload_info.calc_point,
+                    is_rented,
+                );
+            }
 
             current_era_machine_snap.insert(
                 machine_id.clone(),
@@ -1955,6 +1637,7 @@ impl<T: Config> Pallet<T> {
         if !is_rented {
             ErasStashPoints::<T>::insert(current_era, current_era_stash_snap);
             ErasMachinePoints::<T>::insert(current_era, current_era_machine_snap);
+
             sys_info.total_rented_gpu -= machine_info.machine_info_detail.committee_upload_info.gpu_num as u64;
             stash_machine.total_rented_gpu -= machine_info.machine_info_detail.committee_upload_info.gpu_num as u64;
         } else {
@@ -1968,143 +1651,6 @@ impl<T: Config> Pallet<T> {
 
         SysInfo::<T>::put(sys_info);
         StashMachines::<T>::insert(&machine_info.machine_stash, stash_machine);
-    }
-
-    // 根据机器得分快照，和委员会膨胀分数，计算应该奖励
-    // end_era分发奖励
-    fn distribute_reward() {
-        let current_era = Self::current_era();
-        let start_era = if current_era > 150 { current_era - 150 } else { 0u32 };
-        let all_stash = Self::get_all_stash();
-
-        for era_index in start_era..=current_era {
-            let era_reward = Self::era_reward(era_index);
-            let era_machine_points = Self::eras_machine_points(era_index).unwrap_or_default();
-            let era_stash_points = Self::eras_stash_points(era_index).unwrap_or_default();
-
-            for a_stash in &all_stash {
-                let mut stash_machine = Self::stash_machines(a_stash);
-
-                for machine_id in stash_machine.total_machine.clone() {
-                    let _ = Self::distrubute_a_machine(
-                        machine_id,
-                        a_stash,
-                        era_reward,
-                        &era_stash_points,
-                        &era_machine_points,
-                        current_era,
-                        era_index,
-                        &mut stash_machine,
-                    );
-                }
-                StashMachines::<T>::insert(a_stash, stash_machine);
-            }
-        }
-    }
-
-    fn distrubute_a_machine(
-        machine_id: MachineId,
-        a_stash: &T::AccountId,
-        era_reward: BalanceOf<T>,
-        era_stash_points: &EraStashPoints<T::AccountId>,
-        era_machine_points: &BTreeMap<MachineId, MachineGradeStatus>,
-        current_era: EraIndex,
-        era_index: EraIndex,
-        stash_machine: &mut StashMachine<BalanceOf<T>>,
-    ) -> Result<(), ()> {
-        let machine_info = Self::machines_info(&machine_id);
-        let will_reward_committee = machine_info.reward_deadline >= current_era;
-        let is_head_mining = era_index == current_era;
-
-        // 计算当时机器实际获得的奖励
-        let machine_points = era_machine_points.get(&machine_id).ok_or(())?;
-        let stash_points = era_stash_points.staker_statistic.get(&a_stash).ok_or(())?;
-        let machine_actual_grade = machine_points.machine_actual_grade(stash_points.inflation);
-
-        // 该Era机器获得的总奖励
-        let machine_total_reward =
-            Perbill::from_rational_approximation(machine_actual_grade, era_stash_points.total) * era_reward;
-        let linear_reward_part = Perbill::from_rational_approximation(75u32, 100u32) * machine_total_reward;
-
-        // 根据是否是第一次释放奖励，计算era_index时奖励数量: 第一次释放25%, 否则释放剩余75%的1/150
-        let release_now = if is_head_mining {
-            machine_total_reward.checked_sub(&linear_reward_part).ok_or(())?
-        } else {
-            Perbill::from_rational_approximation(1u32, 150u32) * linear_reward_part
-        };
-
-        // 如果奖励不发给委员会
-        if !will_reward_committee {
-            if is_head_mining {
-                // 更新一些数据
-                stash_machine.total_earned_reward =
-                    stash_machine.total_earned_reward.checked_add(&machine_total_reward).ok_or(())?;
-                ErasMachineReward::<T>::insert(current_era, &machine_id, machine_total_reward);
-                ErasStashReward::<T>::mutate(&current_era, &a_stash, |old_value| *old_value += machine_total_reward);
-            }
-            // 发放奖励
-            // 没有委员会来分，则全部奖励给stash账户
-            stash_machine.can_claim_reward = stash_machine.can_claim_reward.checked_add(&release_now).ok_or(())?;
-            ErasMachineReleasedReward::<T>::mutate(&current_era, &machine_id, |old_value| *old_value += release_now);
-            ErasStashReleasedReward::<T>::mutate(&current_era, &machine_info.machine_stash, |old_value| {
-                *old_value += release_now
-            });
-        } else {
-            // 头矿时更新记录
-            if is_head_mining {
-                // 如果委员的奖励时间会很快就要结束了
-                // 则奖励的前一部分给委员会一部分，后一部分，不给委员会
-                if machine_info.reward_deadline >= current_era + 150 {
-                    let reward_to_stash = Perbill::from_rational_approximation(99u64, 100u64) * machine_total_reward;
-                    stash_machine.total_earned_reward =
-                        stash_machine.total_earned_reward.checked_add(&reward_to_stash).ok_or(())?;
-                    ErasMachineReward::<T>::insert(current_era, &machine_id, reward_to_stash);
-                    ErasStashReward::<T>::mutate(&current_era, &machine_info.machine_stash, |old_value| {
-                        *old_value += reward_to_stash;
-                    });
-                } else {
-                    // 计算委员会奖励结束后，机器拥有者单独获得的奖励
-                    let only_reward_to_stash_duration = current_era + 150 - machine_info.reward_deadline;
-                    let reward_to_stash2 =
-                        Perbill::from_rational_approximation(only_reward_to_stash_duration, 150) * machine_total_reward;
-
-                    // 计算委员会奖励结束前，机器拥有者单独获得的奖励
-                    let reward_to_both = machine_total_reward - reward_to_stash2;
-                    let reward_to_stash1 = Perbill::from_rational_approximation(99u32, 100u32) * reward_to_both;
-
-                    let stash_all_get = reward_to_stash1 + reward_to_stash2;
-                    stash_machine.total_earned_reward =
-                        stash_machine.total_earned_reward.checked_add(&stash_all_get).ok_or(())?;
-
-                    ErasMachineReward::<T>::insert(current_era, &machine_id, stash_all_get);
-                    ErasStashReward::<T>::mutate(&current_era, &machine_info.machine_stash, |old_value| {
-                        *old_value += stash_all_get
-                    });
-                }
-            }
-
-            // 99% 分给stash账户
-            let release_to_stash = Perbill::from_rational_approximation(99u64, 100u64) * release_now;
-            stash_machine.can_claim_reward += release_to_stash;
-
-            ErasMachineReleasedReward::<T>::mutate(&current_era, &machine_id, |old_value| {
-                *old_value += release_to_stash
-            });
-            ErasStashReleasedReward::<T>::mutate(&current_era, &machine_info.machine_stash, |old_value| {
-                *old_value += release_to_stash
-            });
-
-            // 剩下分给committee
-            let release_to_committee = release_now - release_to_stash;
-            let committee_each_get =
-                Perbill::from_rational_approximation(1u64, machine_info.reward_committee.len() as u64) *
-                    release_to_committee;
-            for a_committee in machine_info.reward_committee.clone() {
-                // T::ManageCommittee::add_reward(a_committee, committee_each_get);
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -2121,8 +1667,8 @@ impl<T: Config> OCOps for Pallet<T> {
     fn oc_booked_machine(id: MachineId) {
         let mut live_machines = Self::live_machines();
 
-        LiveMachine::rm_machine_id(&mut live_machines.confirmed_machine, &id);
-        LiveMachine::add_machine_id(&mut live_machines.booked_machine, id.clone());
+        ItemList::rm_item(&mut live_machines.confirmed_machine, &id);
+        ItemList::add_item(&mut live_machines.booked_machine, id.clone());
 
         let mut machine_info = Self::machines_info(&id);
         machine_info.machine_status = MachineStatus::CommitteeVerifying;
@@ -2135,8 +1681,8 @@ impl<T: Config> OCOps for Pallet<T> {
     fn oc_revert_booked_machine(id: MachineId) {
         let mut live_machines = Self::live_machines();
 
-        LiveMachine::rm_machine_id(&mut live_machines.booked_machine, &id);
-        LiveMachine::add_machine_id(&mut live_machines.confirmed_machine, id.clone());
+        ItemList::rm_item(&mut live_machines.booked_machine, &id);
+        ItemList::add_item(&mut live_machines.confirmed_machine, id.clone());
 
         let mut machine_info = Self::machines_info(&id);
         machine_info.machine_status = MachineStatus::DistributingOrder;
@@ -2153,17 +1699,16 @@ impl<T: Config> OCOps for Pallet<T> {
     ) -> Result<(), ()> {
         let now = <frame_system::Module<T>>::block_number();
         let current_era = Self::current_era();
+        let machine_id = committee_upload_info.machine_id.clone();
 
-        let mut machine_info = Self::machines_info(&committee_upload_info.machine_id);
+        let mut machine_info = Self::machines_info(&machine_id);
         let mut live_machines = Self::live_machines();
 
-        let is_reonline =
-            UserReonlineStake::<T>::contains_key(&machine_info.machine_stash, &committee_upload_info.machine_id);
+        let is_reonline = UserMutHardwareStake::<T>::contains_key(&machine_info.machine_stash, &machine_id);
 
-        LiveMachine::rm_machine_id(&mut live_machines.booked_machine, &committee_upload_info.machine_id);
+        ItemList::rm_item(&mut live_machines.booked_machine, &machine_id);
 
         machine_info.machine_info_detail.committee_upload_info = committee_upload_info.clone();
-
         if !is_reonline {
             machine_info.reward_committee = reported_committee.clone();
         }
@@ -2175,10 +1720,7 @@ impl<T: Config> OCOps for Pallet<T> {
             .ok_or(())?;
         if let Some(extra_stake) = stake_need.checked_sub(&machine_info.stake_amount) {
             if Self::change_user_total_stake(machine_info.machine_stash.clone(), extra_stake, true).is_ok() {
-                LiveMachine::add_machine_id(
-                    &mut live_machines.online_machine,
-                    committee_upload_info.machine_id.clone(),
-                );
+                ItemList::add_item(&mut live_machines.online_machine, machine_id.clone());
                 machine_info.stake_amount = stake_need;
                 machine_info.machine_status = MachineStatus::Online;
                 machine_info.last_online_height = now;
@@ -2189,45 +1731,41 @@ impl<T: Config> OCOps for Pallet<T> {
                     machine_info.reward_deadline = current_era + REWARD_DURATION;
                 }
             } else {
-                LiveMachine::add_machine_id(
-                    &mut live_machines.fulfilling_machine,
-                    committee_upload_info.machine_id.clone(),
-                );
+                ItemList::add_item(&mut live_machines.fulfilling_machine, machine_id.clone());
                 machine_info.machine_status = MachineStatus::WaitingFulfill;
             }
         } else {
-            LiveMachine::add_machine_id(&mut live_machines.online_machine, committee_upload_info.machine_id.clone());
+            ItemList::add_item(&mut live_machines.online_machine, machine_id.clone());
             machine_info.machine_status = MachineStatus::Online;
             if !is_reonline {
                 machine_info.reward_deadline = current_era + REWARD_DURATION;
             }
         }
 
-        MachinesInfo::<T>::insert(committee_upload_info.machine_id.clone(), machine_info.clone());
+        MachinesInfo::<T>::insert(&machine_id, machine_info.clone());
         LiveMachines::<T>::put(live_machines);
 
         if is_reonline {
             // 根据质押，奖励给这些委员会
-            let reonline_stake =
-                Self::user_reonline_stake(&machine_info.machine_stash, &committee_upload_info.machine_id);
-            let _ = Self::reward_reonline_committee(
+            let reonline_stake = Self::user_mut_hardware_stake(&machine_info.machine_stash, &machine_id);
+
+            let _ = Self::slash_and_reward(
                 machine_info.machine_stash.clone(),
                 reonline_stake.stake_amount,
                 reported_committee,
             );
         }
-
         // NOTE: Must be after MachinesInfo change, which depend on machine_info
         if let MachineStatus::Online = machine_info.machine_status {
-            Self::change_pos_gpu_by_online(&committee_upload_info.machine_id, true);
-            Self::update_snap_by_online_status(committee_upload_info.machine_id.clone(), true);
+            Self::change_pos_info_by_online(&machine_info, true);
+            Self::update_snap_by_online_status(machine_id.clone(), true);
 
             if is_reonline {
                 // 仅在Oline成功时删掉reonline_stake记录，以便补充质押时惩罚时检查状态
                 let reonline_stake =
-                    Self::user_reonline_stake(&machine_info.machine_stash, &committee_upload_info.machine_id);
+                    Self::user_mut_hardware_stake(&machine_info.machine_stash, &committee_upload_info.machine_id);
 
-                UserReonlineStake::<T>::remove(&machine_info.machine_stash, &committee_upload_info.machine_id);
+                UserMutHardwareStake::<T>::remove(&machine_info.machine_stash, &committee_upload_info.machine_id);
 
                 // 惩罚该机器，如果机器是Fulfill，则等待Fulfill之后，再进行惩罚
                 let offline_duration = now - reonline_stake.offline_time;
@@ -2236,6 +1774,16 @@ impl<T: Config> OCOps for Pallet<T> {
                     OPSlashReason::OnlineReportOffline(offline_duration),
                     None,
                     None,
+                );
+            } else {
+                MachineRecentReward::<T>::insert(
+                    &machine_id,
+                    MachineRecentRewardInfo {
+                        machine_stash: machine_info.machine_stash.clone(),
+                        reward_committee_deadline: machine_info.reward_deadline,
+                        reward_committee: machine_info.reward_committee.clone(),
+                        ..Default::default()
+                    },
                 );
             }
         }
@@ -2248,85 +1796,46 @@ impl<T: Config> OCOps for Pallet<T> {
         // Refuse controller bond machine, and clean storage
         let machine_info = Self::machines_info(&machine_id);
         let mut live_machines = Self::live_machines();
-        let mut stash_stake = Self::stash_stake(&machine_info.machine_stash);
 
         // In case this offline is for change hardware info, when reonline is refused, reward to committee and
         // machine info should not be deleted
-        let is_mut_hardware = live_machines.refused_mut_hardware_machine.binary_search(&machine_id).is_ok();
+        let is_mut_hardware = UserMutHardwareStake::<T>::contains_key(&machine_info.machine_stash, &machine_id);
         if is_mut_hardware {
-            let reonline_stake = Self::user_reonline_stake(&machine_info.machine_stash, &machine_id);
-            let now = <frame_system::Module<T>>::block_number();
+            let reonline_stake = Self::user_mut_hardware_stake(&machine_info.machine_stash, &machine_id);
 
-            let slash_id = Self::get_new_slash_id();
-            let slash_info = OPPendingSlashInfo {
-                slash_who: machine_info.machine_stash,
-                machine_id: machine_id.clone(),
-                slash_time: now,
-                slash_amount: reonline_stake.stake_amount,
-                slash_exec_time: now + (2880u32 * 2).saturated_into::<T::BlockNumber>(),
-                reward_to_reporter: None,
-                reward_to_committee: None,
-                slash_reason: OPSlashReason::CommitteeRefusedMutHardware,
-            };
-            PendingSlash::<T>::insert(slash_id, slash_info);
-
-            LiveMachine::rm_machine_id(&mut live_machines.refused_mut_hardware_machine, &machine_id);
-            LiveMachine::add_machine_id(&mut live_machines.bonding_machine, machine_id.clone());
+            ItemList::rm_item(&mut live_machines.refused_mut_hardware_machine, &machine_id);
+            ItemList::add_item(&mut live_machines.bonding_machine, machine_id.clone());
 
             LiveMachines::<T>::put(live_machines);
-            // TODO: change here
-            return None
+            return Some((machine_info.machine_stash, reonline_stake.stake_amount))
         }
 
-        let now = <frame_system::Module<T>>::block_number();
-        let mut sys_info = Self::sys_info();
+        // let mut sys_info = Self::sys_info();
         let mut stash_machines = Self::stash_machines(&machine_info.machine_stash);
         let mut controller_machines = Self::controller_machines(&machine_info.controller);
 
-        sys_info.total_stake = sys_info.total_stake.checked_sub(&machine_info.stake_amount)?;
-
         // Slash 5% of init stake(5% of one gpu stake)
         let slash = Perbill::from_rational_approximation(5u64, 100u64) * machine_info.stake_amount;
+
         let left_stake = machine_info.stake_amount.checked_sub(&slash)?;
-
+        // Remain 5% of init stake(5% of one gpu stake)
         // Return 95% left stake(95% of one gpu stake)
-        <T as pallet::Config>::Currency::unreserve(&machine_info.machine_stash, left_stake);
-        stash_stake = stash_stake.checked_sub(&left_stake)?;
-
-        // Add a pending slash
-        let slash_id = Self::get_new_slash_id();
-        let slash_info = OPPendingSlashInfo {
-            slash_who: machine_info.machine_stash.clone(),
-            machine_id: machine_id.clone(),
-            slash_time: now,
-            slash_amount: slash,
-            slash_exec_time: now + (2880u32 * 2).saturated_into::<T::BlockNumber>(),
-            reward_to_reporter: None,
-            reward_to_committee: None,
-            slash_reason: OPSlashReason::CommitteeRefusedOnline,
-        };
+        let _ = Self::change_user_total_stake(machine_info.machine_stash.clone(), left_stake, false);
 
         // Clean storage
-        if let Ok(index) = controller_machines.binary_search(&machine_id) {
-            controller_machines.remove(index);
-        }
-        if let Ok(index) = stash_machines.total_machine.binary_search(&machine_id) {
-            stash_machines.total_machine.remove(index);
-        }
+        ItemList::rm_item(&mut controller_machines, &machine_id);
+        ItemList::rm_item(&mut stash_machines.total_machine, &machine_id);
 
         let mut live_machines = Self::live_machines();
-        LiveMachine::rm_machine_id(&mut live_machines.booked_machine, &machine_id);
-        LiveMachine::add_machine_id(&mut live_machines.refused_machine, machine_id.clone());
+        ItemList::rm_item(&mut live_machines.booked_machine, &machine_id);
+        ItemList::add_item(&mut live_machines.refused_machine, machine_id.clone());
 
-        StashStake::<T>::insert(&machine_info.machine_stash, stash_stake);
         LiveMachines::<T>::put(live_machines);
-        PendingSlash::<T>::insert(slash_id, slash_info);
         MachinesInfo::<T>::remove(&machine_id);
         ControllerMachines::<T>::insert(&machine_info.controller, controller_machines);
         StashMachines::<T>::insert(&machine_info.machine_stash, stash_machines);
-        SysInfo::<T>::put(sys_info);
 
-        None
+        Some((machine_info.machine_stash, slash))
     }
 
     // stake some balance when apply for slash review
@@ -2355,6 +1864,7 @@ impl<T: Config> RTOps for Pallet<T> {
     type AccountId = T::AccountId;
     type Balance = BalanceOf<T>;
 
+    /// 根据GPU数量和该机器算力点数，计算该机器相比标准配置的租用价格
     fn get_machine_price(machine_point: u64) -> Option<u64> {
         let standard_gpu_point_price = Self::standard_gpu_point_price()?;
         standard_gpu_point_price
@@ -2365,6 +1875,7 @@ impl<T: Config> RTOps for Pallet<T> {
             .checked_div(10_000)
     }
 
+    // TODO: change here
     fn change_machine_status(
         machine_id: &MachineId,
         new_status: MachineStatus<T::BlockNumber, T::AccountId>,
@@ -2374,43 +1885,50 @@ impl<T: Config> RTOps for Pallet<T> {
         let mut machine_info = Self::machines_info(machine_id);
         let mut live_machines = Self::live_machines();
 
-        machine_info.machine_status = new_status.clone();
-        machine_info.last_machine_renter = renter;
+        machine_info.last_machine_renter = renter.clone();
 
         match new_status {
             MachineStatus::Rented => {
-                machine_info.total_rented_times += 1;
                 // 机器创建成功
+                machine_info.machine_status = new_status;
+                machine_info.total_rented_times += 1;
                 Self::update_snap_by_rent_status(machine_id.to_vec(), true);
 
-                if let Ok(index) = live_machines.online_machine.binary_search(&machine_id) {
-                    live_machines.online_machine.remove(index);
-                    if let Err(index) = live_machines.rented_machine.binary_search(&machine_id) {
-                        live_machines.rented_machine.insert(index, machine_id.clone());
-                        LiveMachines::<T>::put(live_machines);
-                    }
-                }
+                ItemList::rm_item(&mut live_machines.online_machine, &machine_id);
+                ItemList::add_item(&mut live_machines.rented_machine, machine_id.clone());
+                LiveMachines::<T>::put(live_machines);
 
-                Self::change_pos_gpu_by_rent(machine_id, true);
+                Self::change_pos_info_by_rent(&machine_info, true);
             },
             // 租用结束 或 租用失败(半小时无确认)
             MachineStatus::Online => {
                 if rent_duration.is_some() {
-                    machine_info.total_rented_duration += rent_duration.unwrap_or_default();
                     // 租用结束
-                    Self::update_snap_by_rent_status(machine_id.to_vec(), false);
+                    machine_info.total_rented_duration += rent_duration.unwrap_or_default();
+                    ItemList::rm_item(&mut live_machines.rented_machine, &machine_id);
 
-                    if let Ok(index) = live_machines.rented_machine.binary_search(&machine_id) {
-                        live_machines.rented_machine.remove(index);
-                        if let Err(index) = live_machines.online_machine.binary_search(&machine_id) {
-                            live_machines.online_machine.insert(index, machine_id.clone());
-                            LiveMachines::<T>::put(live_machines);
-                        }
+                    match machine_info.machine_status {
+                        MachineStatus::ReporterReportOffline(..) | MachineStatus::StakerReportOffline(..) =>
+                            if let Some(renter) = renter {
+                                RentedFinished::<T>::insert(machine_id, renter);
+                            },
+                        MachineStatus::Rented => {
+                            machine_info.machine_status = new_status;
+                            machine_info.last_online_height = <frame_system::Module<T>>::block_number();
+                            // 租用结束
+                            Self::update_snap_by_rent_status(machine_id.to_vec(), false);
+
+                            ItemList::add_item(&mut live_machines.online_machine, machine_id.clone());
+
+                            Self::change_pos_info_by_rent(&machine_info, false);
+                        },
+                        _ => {},
                     }
 
-                    Self::change_pos_gpu_by_rent(machine_id, false);
+                    LiveMachines::<T>::put(live_machines);
                 }
             },
+            MachineStatus::Creating => machine_info.machine_status = new_status,
             _ => {},
         }
 
@@ -2561,5 +2079,707 @@ impl<T: Config> Module<T> {
     /// 获得某个Stash账户某个Era实际解锁的奖励数量
     pub fn get_stash_era_released_reward(stash: T::AccountId, era_index: EraIndex) -> BalanceOf<T> {
         Self::eras_stash_released_reward(era_index, stash)
+    }
+
+    // Reference： primitives/core/src/crypto.rs: impl Ss58Codec for AccountId32
+    // from_ss58check_with_version
+    pub fn get_accountid32(addr: &Vec<u8>) -> Option<[u8; 32]> {
+        let mut data: [u8; 35] = [0; 35];
+
+        let length = bs58::decode(addr).into(&mut data).ok()?;
+        if length != 35 {
+            return None
+        }
+
+        let (_prefix_len, _ident) = match data[0] {
+            0..=63 => (1, data[0] as u16),
+            _ => return None,
+        };
+
+        let account_id32: [u8; 32] = data[1..33].try_into().ok()?;
+        Some(account_id32)
+    }
+
+    // [u8; 64] -> str -> [u8; 32] -> pubkey
+    pub fn verify_sig(msg: Vec<u8>, sig: Vec<u8>, account: Vec<u8>) -> Option<()> {
+        let signature = sp_core::sr25519::Signature::try_from(&sig[..]).ok()?;
+        // let public = Self::get_public_from_str(&account)?;
+
+        let pubkey_str = str::from_utf8(&account).ok()?;
+        let pubkey_hex: Result<Vec<u8>, _> =
+            (0..pubkey_str.len()).step_by(2).map(|i| u8::from_str_radix(&pubkey_str[i..i + 2], 16)).collect();
+        let pubkey_hex = pubkey_hex.ok()?;
+
+        let account_id32: [u8; 32] = pubkey_hex.try_into().ok()?;
+        let public = sp_core::sr25519::Public::from_slice(&account_id32);
+
+        signature.verify(&msg[..], &public.into()).then(|| ())
+    }
+
+    pub fn backup_and_reward(now: T::BlockNumber) {
+        let block_offset = now.saturated_into::<u64>() % BLOCK_PER_ERA;
+
+        match block_offset {
+            2 => {
+                // back up all machine_id; current era machine grade snap; current era stash grade snap
+                let mut all_machine = Vec::new();
+                let all_stash = Self::get_all_stash();
+                for a_stash in &all_stash {
+                    let stash_machine = Self::stash_machines(a_stash);
+                    all_machine.extend(stash_machine.total_machine);
+                }
+
+                let machine_num = all_machine.len() as u64;
+
+                AllMachineIdSnap::<T>::put((all_machine, machine_num));
+            },
+            3..=62 => {
+                // distribute reward
+                let mut all_machine = Self::all_machine_id_snap();
+                let release_num = all_machine.1 / 60;
+
+                let release_era = Self::current_era() - 1;
+                let era_total_reward = Self::era_reward(release_era);
+                let era_machine_points = Self::eras_machine_points2(release_era);
+                let era_stash_points = Self::eras_stash_points2(release_era);
+
+                for _ in 0..=release_num {
+                    if let Some(machine_id) = all_machine.0.pop_front() {
+                        Self::distribute_reward_to_machine(
+                            machine_id,
+                            release_era,
+                            era_total_reward,
+                            &era_machine_points,
+                            &era_stash_points,
+                        );
+                    } else {
+                        return
+                    }
+                }
+
+                AllMachineIdSnap::<T>::put(all_machine);
+            },
+            _ => return,
+        }
+    }
+
+    pub fn update_snap_for_new_era() {
+        // current era cannot be calced from block_number, for chain upgrade
+        let current_era = Self::current_era() + 1;
+        CurrentEra::<T>::put(current_era);
+
+        let era_reward = Self::current_era_reward().unwrap_or_default();
+        EraReward::<T>::insert(current_era, era_reward);
+
+        if current_era == 1 {
+            ErasStashPoints2::<T>::insert(0, EraStashPoints { ..Default::default() });
+            ErasStashPoints2::<T>::insert(1, EraStashPoints { ..Default::default() });
+            ErasStashPoints2::<T>::insert(2, EraStashPoints { ..Default::default() });
+            let init_value: BTreeMap<MachineId, MachineGradeStatus> = BTreeMap::new();
+            ErasMachinePoints2::<T>::insert(0, init_value.clone());
+            ErasMachinePoints2::<T>::insert(1, init_value.clone());
+            ErasMachinePoints2::<T>::insert(2, init_value);
+        } else {
+            // 用当前的Era快照初始化下一个Era的信息
+            let current_era_stash_snapshot = Self::eras_stash_points2(current_era);
+            ErasStashPoints2::<T>::insert(current_era + 1, current_era_stash_snapshot);
+            let current_era_machine_snapshot = Self::eras_machine_points2(current_era);
+            ErasMachinePoints2::<T>::insert(current_era + 1, current_era_machine_snapshot);
+        }
+    }
+
+    pub fn get_account_from_str(addr: &Vec<u8>) -> Option<T::AccountId> {
+        let account_id32: [u8; 32] = Self::get_accountid32(addr)?;
+        T::AccountId::decode(&mut &account_id32[..]).ok()
+    }
+
+    // 质押DBC机制：[0, 10000] GPU: 100000 DBC per GPU
+    // (10000, +) -> min( 100000 * 10000 / (10000 + n), 5w RMB DBC
+    pub fn stake_per_gpu() -> Option<BalanceOf<T>> {
+        let sys_info = Self::sys_info();
+        let online_stake_params = Self::online_stake_params()?;
+
+        let dbc_stake_per_gpu = if sys_info.total_gpu_num > 10_000 {
+            Perbill::from_rational_approximation(10_000u64, sys_info.total_gpu_num) *
+                online_stake_params.online_stake_per_gpu
+        } else {
+            online_stake_params.online_stake_per_gpu
+        };
+
+        let stake_limit = T::DbcPrice::get_dbc_amount_by_value(online_stake_params.online_stake_usd_limit)?;
+        Some(dbc_stake_per_gpu.min(stake_limit)) // .checked_mul(&gpu_num.saturated_into::<BalanceOf<T>>())
+    }
+}
+
+impl<T: Config> Pallet<T> {
+    pub fn get_new_slash_id() -> u64 {
+        let slash_id = Self::next_slash_id();
+
+        if slash_id == u64::MAX {
+            NextSlashId::<T>::put(0);
+        } else {
+            NextSlashId::<T>::put(slash_id + 1);
+        };
+
+        slash_id
+    }
+
+    pub fn slash_and_reward(
+        slash_who: T::AccountId,
+        slash_amount: BalanceOf<T>,
+        reward_to: Vec<T::AccountId>,
+    ) -> Result<(), ()> {
+        let mut stash_stake = Self::stash_stake(&slash_who);
+        let mut sys_info = Self::sys_info();
+
+        sys_info.total_stake = sys_info.total_stake.checked_sub(&slash_amount).ok_or(())?;
+        stash_stake = stash_stake.checked_sub(&slash_amount).ok_or(())?;
+
+        let _ = T::SlashAndReward::slash_and_reward(vec![slash_who.clone()], slash_amount, reward_to);
+
+        StashStake::<T>::insert(&slash_who, stash_stake);
+        SysInfo::<T>::put(sys_info);
+        Ok(())
+    }
+
+    pub fn do_pending_slash() {
+        let now = <frame_system::Module<T>>::block_number();
+        let all_slash_id = <PendingSlash<T> as IterableStorageMap<u64, _>>::iter()
+            .map(|(slash_id, _)| slash_id)
+            .collect::<Vec<_>>();
+
+        for slash_id in all_slash_id {
+            let slash_info = Self::pending_slash(slash_id);
+            if now < slash_info.slash_exec_time {
+                continue
+            }
+
+            match slash_info.slash_reason {
+                OPSlashReason::CommitteeRefusedOnline | OPSlashReason::CommitteeRefusedMutHardware => {
+                    let _ = Self::slash_and_reward(
+                        slash_info.slash_who.clone(),
+                        slash_info.slash_amount,
+                        slash_info.reward_to_committee.unwrap_or_default(),
+                    );
+                },
+                _ => {
+                    Self::do_slash_deposit(&slash_info);
+                },
+            }
+
+            Self::deposit_event(Event::<T>::SlashExecuted(
+                slash_info.slash_who,
+                slash_info.machine_id,
+                slash_info.slash_amount,
+            ));
+
+            PendingSlash::<T>::remove(slash_id);
+        }
+    }
+
+    // 主动惩罚超过下线阈值的机器
+    pub fn check_offline_machine_duration() {
+        let live_machine = Self::live_machines();
+        let now = <frame_system::Module<T>>::block_number();
+
+        for a_machine in live_machine.offline_machine {
+            let machine_info = Self::machines_info(&a_machine);
+            match machine_info.machine_status {
+                MachineStatus::StakerReportOffline(offline_time, status) => {
+                    if now - offline_time < MAX_SLASH_THRESHOLD.into() {
+                        continue
+                    }
+
+                    match *status {
+                        MachineStatus::Online => {
+                            Self::add_offline_slash(
+                                50,
+                                a_machine,
+                                machine_info.last_machine_renter,
+                                None,
+                                OPSlashReason::OnlineReportOffline(offline_time),
+                            );
+                        },
+
+                        MachineStatus::Rented => {
+                            if now - offline_time < (2 * MAX_SLASH_THRESHOLD).into() {
+                                continue
+                            }
+                            Self::add_offline_slash(
+                                80,
+                                a_machine,
+                                None,
+                                None,
+                                OPSlashReason::RentedReportOffline(offline_time),
+                            );
+                        },
+                        _ => continue,
+                    }
+                },
+                MachineStatus::ReporterReportOffline(offline_reason, _status, _reporter, committee) => {
+                    match offline_reason {
+                        // 被举报时
+                        OPSlashReason::RentedInaccessible(report_time) |
+                        OPSlashReason::RentedHardwareCounterfeit(report_time) |
+                        OPSlashReason::RentedHardwareMalfunction(report_time) |
+                        OPSlashReason::OnlineRentFailed(report_time) => {
+                            if now - report_time < MAX_SLASH_THRESHOLD.into() {
+                                continue
+                            }
+                            Self::add_offline_slash(
+                                100,
+                                a_machine,
+                                machine_info.last_machine_renter,
+                                Some(committee),
+                                offline_reason,
+                            );
+                        },
+
+                        _ => continue,
+                    }
+                },
+                _ => continue,
+            }
+        }
+    }
+
+    // Return slashed amount when slash is executed
+    pub fn slash_when_report_offline(
+        machine_id: MachineId,
+        slash_reason: OPSlashReason<T::BlockNumber>,
+        reporter: Option<T::AccountId>,
+        committee: Option<Vec<T::AccountId>>,
+    ) -> OPPendingSlashInfo<T::AccountId, T::BlockNumber, BalanceOf<T>> {
+        match slash_reason {
+            // 算工主动报告被租用的机器，主动下线
+            OPSlashReason::RentedReportOffline(duration) =>
+                Self::add_slash_rented_report_offline(machine_id, duration, slash_reason),
+            // 算工主动报告在线的机器，主动下线
+            OPSlashReason::OnlineReportOffline(duration) =>
+                Self::add_slash_online_report_offline(machine_id, duration, slash_reason),
+            // 机器处于租用状态，无法访问，这种情况下，reporter == renter
+            OPSlashReason::RentedInaccessible(duration) =>
+                Self::add_slash_rented_inaccessible(machine_id, duration, slash_reason, reporter, committee),
+            // 机器处于租用状态，机器出现故障
+            OPSlashReason::RentedHardwareMalfunction(duration) =>
+                Self::add_slash_rented_hardware_mulfunction(machine_id, duration, slash_reason, reporter, committee),
+            // 机器处于租用状态，机器硬件造假
+            OPSlashReason::RentedHardwareCounterfeit(duration) =>
+                Self::add_slash_rented_hardware_counterfeit(machine_id, duration, slash_reason, reporter, committee),
+            // 机器在线，被举报无法租用
+            OPSlashReason::OnlineRentFailed(duration) =>
+                Self::add_slash_online_rent_failed(machine_id, duration, slash_reason, reporter, committee),
+            _ => return OPPendingSlashInfo::default(),
+        }
+    }
+
+    fn add_slash_rented_report_offline(
+        machine_id: MachineId,
+        duration: T::BlockNumber,
+        slash_reason: OPSlashReason<T::BlockNumber>,
+    ) -> OPPendingSlashInfo<T::AccountId, T::BlockNumber, BalanceOf<T>> {
+        let machine_info = Self::machines_info(&machine_id);
+        let duration = duration.saturated_into::<u64>();
+        match duration {
+            0 => return OPPendingSlashInfo::default(),
+            // 下线不超过7分钟
+            1..=14 => {
+                // 扣除2%质押币。100%进入国库。
+                return Self::add_offline_slash(2, machine_id, None, None, slash_reason)
+            },
+            // 不超过48小时
+            15..=5760 => {
+                // 扣除4%质押币。100%进入国库
+                return Self::add_offline_slash(4, machine_id, None, None, slash_reason)
+            },
+            // 不超过120小时
+            5761..=14400 => {
+                // 扣除30%质押币，10%给到用户，90%进入国库
+                return Self::add_offline_slash(30, machine_id, machine_info.last_machine_renter, None, slash_reason)
+            },
+            // 超过120小时
+            _ => {
+                // 扣除50%押金。10%给到用户，90%进入国库
+                return Self::add_offline_slash(50, machine_id, machine_info.last_machine_renter, None, slash_reason)
+            },
+        }
+    }
+
+    fn add_slash_online_report_offline(
+        machine_id: MachineId,
+        duration: T::BlockNumber,
+        slash_reason: OPSlashReason<T::BlockNumber>,
+    ) -> OPPendingSlashInfo<T::AccountId, T::BlockNumber, BalanceOf<T>> {
+        let now = <frame_system::Module<T>>::block_number();
+        let machine_info = Self::machines_info(&machine_id);
+
+        // 判断是否已经下线十天，如果是，则不进行惩罚，仅仅下线处理
+        // NOTE: 此时，machine_info.last_online_height还未改变
+        if now > 28800u32.saturated_into::<T::BlockNumber>() + duration + machine_info.last_online_height {
+            return OPPendingSlashInfo::default()
+        }
+        let duration = duration.saturated_into::<u64>();
+        match duration {
+            0 => return OPPendingSlashInfo::default(),
+            // 下线不超过7分钟
+            1..=14 => {
+                // 扣除2%质押币，质押币全部进入国库。
+                return Self::add_offline_slash(2, machine_id, None, None, slash_reason)
+            },
+            // 下线不超过48小时
+            15..=5760 => {
+                // 扣除4%质押币，质押币全部进入国库
+                return Self::add_offline_slash(4, machine_id, None, None, slash_reason)
+            },
+            // 不超过240小时
+            5761..=28800 => {
+                // 扣除30%质押币，质押币全部进入国库
+                return Self::add_offline_slash(30, machine_id, None, None, slash_reason)
+            },
+            _ => {
+                // TODO: 如果机器从首次上线时间起超过365天，剩下20%押金可以申请退回。
+                // 扣除80%质押币。质押币全部进入国库。
+                return Self::add_offline_slash(80, machine_id, None, None, slash_reason)
+            },
+        }
+    }
+
+    fn add_slash_rented_inaccessible(
+        machine_id: MachineId,
+        duration: T::BlockNumber,
+        slash_reason: OPSlashReason<T::BlockNumber>,
+        reporter: Option<T::AccountId>,
+        committee: Option<Vec<T::AccountId>>,
+    ) -> OPPendingSlashInfo<T::AccountId, T::BlockNumber, BalanceOf<T>> {
+        let duration = duration.saturated_into::<u64>();
+        match duration {
+            0 => return OPPendingSlashInfo::default(),
+            // 不超过7分钟
+            1..=14 => {
+                // 扣除4%质押币。10%给验证人，90%进入国库
+                return Self::add_offline_slash(4, machine_id, None, committee, slash_reason)
+            },
+            // 不超过48小时
+            15..=5760 => {
+                // 扣除8%质押币。10%给验证人，90%进入国库
+                return Self::add_offline_slash(8, machine_id, None, committee, slash_reason)
+            },
+            // 不超过120小时
+            5761..=14400 => {
+                // 扣除60%质押币。10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(60, machine_id, reporter, committee, slash_reason)
+            },
+            // 超过120小时
+            _ => {
+                // 扣除100%押金。10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(100, machine_id, reporter, committee, slash_reason)
+            },
+        }
+    }
+
+    fn add_slash_rented_hardware_mulfunction(
+        machine_id: MachineId,
+        duration: T::BlockNumber,
+        slash_reason: OPSlashReason<T::BlockNumber>,
+        reporter: Option<T::AccountId>,
+        committee: Option<Vec<T::AccountId>>,
+    ) -> OPPendingSlashInfo<T::AccountId, T::BlockNumber, BalanceOf<T>> {
+        let duration = duration.saturated_into::<u64>();
+        match duration {
+            0 => return OPPendingSlashInfo::default(),
+            //不超过4小时
+            1..=480 => {
+                // 扣除6%质押币。10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(6, machine_id, reporter, committee, slash_reason)
+            },
+            // 不超过24小时
+            481..=2880 => {
+                // 扣除12%质押币。10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(12, machine_id, reporter, committee, slash_reason)
+            },
+            // 不超过48小时
+            2881..=5760 => {
+                // 扣除16%质押币。10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(16, machine_id, reporter, committee, slash_reason)
+            },
+            // 不超过120小时
+            5761..=14400 => {
+                // 扣除60%质押币。10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(60, machine_id, reporter, committee, slash_reason)
+            },
+            _ => {
+                // 扣除100%押金，10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(100, machine_id, reporter, committee, slash_reason)
+            },
+        }
+    }
+
+    fn add_slash_rented_hardware_counterfeit(
+        machine_id: MachineId,
+        duration: T::BlockNumber,
+        slash_reason: OPSlashReason<T::BlockNumber>,
+        reporter: Option<T::AccountId>,
+        committee: Option<Vec<T::AccountId>>,
+    ) -> OPPendingSlashInfo<T::AccountId, T::BlockNumber, BalanceOf<T>> {
+        let duration = duration.saturated_into::<u64>();
+        match duration {
+            0 => return OPPendingSlashInfo::default(),
+            // 下线不超过4小时
+            1..=480 => {
+                // 扣除12%质押币。10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(12, machine_id, reporter, committee, slash_reason)
+            },
+            // 不超过24小时
+            481..=2880 => {
+                // 扣除24%质押币。10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(24, machine_id, reporter, committee, slash_reason)
+            },
+            // 不超过48小时
+            2881..=5760 => {
+                // 扣除32%质押币。10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(32, machine_id, reporter, committee, slash_reason)
+            },
+            // 不超过120小时
+            5761..=14400 => {
+                // 扣除60%质押币。10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(60, machine_id, reporter, committee, slash_reason)
+            },
+            _ => {
+                // 扣除100%押金，10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(100, machine_id, reporter, committee, slash_reason)
+            },
+        }
+    }
+
+    fn add_slash_online_rent_failed(
+        machine_id: MachineId,
+        duration: T::BlockNumber,
+        slash_reason: OPSlashReason<T::BlockNumber>,
+        reporter: Option<T::AccountId>,
+        committee: Option<Vec<T::AccountId>>,
+    ) -> OPPendingSlashInfo<T::AccountId, T::BlockNumber, BalanceOf<T>> {
+        let duration = duration.saturated_into::<u64>();
+        match duration {
+            0 => return OPPendingSlashInfo::default(),
+            1..=480 => {
+                // 扣除6%质押币。10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(6, machine_id, reporter, committee, slash_reason)
+            },
+            481..=2880 => {
+                // 扣除12%质押币。10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(12, machine_id, reporter, committee, slash_reason)
+            },
+            2881..=5760 => {
+                // 扣除16%质押币。10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(16, machine_id, reporter, committee, slash_reason)
+            },
+            5761..=14400 => {
+                // 扣除60%质押币。10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(60, machine_id, reporter, committee, slash_reason)
+            },
+            _ => {
+                // 扣除100%押金，10%给到用户，20%给到验证人，70%进入国库
+                return Self::add_offline_slash(100, machine_id, reporter, committee, slash_reason)
+            },
+        }
+    }
+
+    pub fn add_offline_slash(
+        slash_percent: u32,
+        machine_id: MachineId,
+        reporter: Option<T::AccountId>,
+        committee: Option<Vec<T::AccountId>>,
+        slash_reason: OPSlashReason<T::BlockNumber>,
+    ) -> OPPendingSlashInfo<T::AccountId, T::BlockNumber, BalanceOf<T>> {
+        let now = <frame_system::Module<T>>::block_number();
+        let machine_info = Self::machines_info(&machine_id);
+        let slash_amount = Perbill::from_rational_approximation(slash_percent, 100) * machine_info.stake_amount;
+
+        OPPendingSlashInfo {
+            slash_who: machine_info.machine_stash,
+            machine_id,
+            slash_time: now,
+            slash_amount,
+            slash_exec_time: now + TWO_DAY.into(),
+            reward_to_reporter: reporter,
+            reward_to_committee: committee,
+            slash_reason,
+        }
+    }
+
+    // 惩罚掉机器押金，如果执行惩罚后机器押金不够，则状态变为补充质押
+    pub fn do_slash_deposit(slash_info: &OPPendingSlashInfo<T::AccountId, T::BlockNumber, BalanceOf<T>>) {
+        let machine_info = Self::machines_info(&slash_info.machine_id);
+
+        let mut reward_to_reporter = Zero::zero();
+        let mut reward_to_committee = Zero::zero();
+
+        if slash_info.reward_to_reporter.is_some() {
+            reward_to_reporter = Perbill::from_rational_approximation(10u32, 100u32) * slash_info.slash_amount;
+        }
+        if slash_info.reward_to_committee.is_some() {
+            reward_to_committee = Perbill::from_rational_approximation(20u32, 100u32) * slash_info.slash_amount;
+        }
+        let slash_to_treasury = slash_info.slash_amount - reward_to_reporter - reward_to_committee;
+
+        if <T as Config>::Currency::reserved_balance(&machine_info.machine_stash) < slash_info.slash_amount {
+            return
+        }
+
+        // reward to reporter:
+        if !reward_to_reporter.is_zero() && slash_info.reward_to_reporter.is_some() {
+            let _ = Self::slash_and_reward(
+                slash_info.slash_who.clone(),
+                reward_to_reporter,
+                vec![slash_info.reward_to_reporter.clone().unwrap()],
+            );
+        }
+        // reward to committee
+        if !reward_to_committee.is_zero() && slash_info.reward_to_committee.is_some() {
+            let _ = Self::slash_and_reward(
+                slash_info.slash_who.clone(),
+                reward_to_committee,
+                slash_info.reward_to_committee.clone().unwrap(),
+            );
+        }
+
+        // slash to treasury
+        let _ = Self::slash_and_reward(slash_info.slash_who.clone(), slash_to_treasury, vec![]);
+    }
+
+    pub fn distribute_reward_to_machine(
+        machine_id: MachineId,
+        release_era: EraIndex,
+        era_total_reward: BalanceOf<T>,
+        era_machine_points: &BTreeMap<MachineId, MachineGradeStatus>,
+        era_stash_points: &EraStashPoints<T::AccountId>,
+    ) {
+        let mut machine_reward_info = Self::machine_recent_reward(&machine_id);
+        let mut stash_machine = Self::stash_machines(&machine_reward_info.machine_stash);
+
+        let machine_total_reward = Self::calc_machine_total_reward(
+            &machine_id,
+            &machine_reward_info.machine_stash,
+            era_total_reward,
+            era_machine_points,
+            era_stash_points,
+        );
+
+        MachineRecentRewardInfo::add_new_reward(&mut machine_reward_info, machine_total_reward);
+
+        if machine_reward_info.recent_reward_sum == Zero::zero() {
+            MachineRecentReward::<T>::insert(&machine_id, machine_reward_info);
+            return
+        }
+
+        let latest_reward = if machine_reward_info.recent_machine_reward.len() > 0 {
+            machine_reward_info.recent_machine_reward[machine_reward_info.recent_machine_reward.len() - 1]
+        } else {
+            Zero::zero()
+        };
+
+        // total released reward = sum(1..n-1) * (1/200) + n * (50/200) = 49/200*n + 1/200 * sum(1..n)
+        let released_reward = Perbill::from_rational_approximation(49u32, 200u32) * latest_reward +
+            Perbill::from_rational_approximation(1u32, 200u32) * machine_reward_info.recent_reward_sum;
+
+        // if should reward to committee
+        let (reward_to_stash, reward_to_committee) = if release_era > machine_reward_info.reward_committee_deadline {
+            // only reward stash
+            (released_reward, Zero::zero())
+        } else {
+            // 1% of released_reward to committee, 99% of released reward to stash
+            let release_to_stash = Perbill::from_rational_approximation(99u32, 100u32) * released_reward;
+            let release_to_committee = released_reward - release_to_stash;
+            (release_to_stash, release_to_committee)
+        };
+
+        let committee_each_get =
+            Perbill::from_rational_approximation(1u32, machine_reward_info.reward_committee.len() as u32) *
+                reward_to_committee;
+        for a_committee in machine_reward_info.reward_committee.clone() {
+            T::ManageCommittee::add_reward(a_committee, committee_each_get);
+        }
+
+        // NOTE: reward of actual get will change depend on how much days left
+        let machine_actual_total_reward = if release_era > machine_reward_info.reward_committee_deadline {
+            machine_total_reward
+        } else if release_era > machine_reward_info.reward_committee_deadline - 150 {
+            // 减去委员会释放的部分
+
+            // 每天机器奖励释放总奖励的1/200 (150天释放75%)
+            let total_daily_release = Perbill::from_rational_approximation(1u32, 200u32) * machine_total_reward;
+            // 委员会每天分得释放奖励的1%
+            let total_committee_release = Perbill::from_rational_approximation(1u32, 100u32) * total_daily_release;
+            // 委员会还能获得奖励的天数
+            let release_day = machine_reward_info.reward_committee_deadline - release_era;
+
+            machine_total_reward - total_committee_release * release_day.saturated_into::<BalanceOf<T>>()
+        } else {
+            Perbill::from_rational_approximation(99u32, 100u32) * machine_total_reward
+        };
+
+        // record reward
+        stash_machine.can_claim_reward += reward_to_stash;
+        stash_machine.total_earned_reward += machine_actual_total_reward;
+        ErasMachineReward::<T>::insert(release_era, &machine_id, machine_actual_total_reward);
+        ErasStashReward::<T>::mutate(&release_era, &machine_reward_info.machine_stash, |old_value| {
+            *old_value += machine_actual_total_reward;
+        });
+
+        ErasMachineReleasedReward::<T>::mutate(&release_era, &machine_id, |old_value| *old_value += reward_to_stash);
+        ErasStashReleasedReward::<T>::mutate(&release_era, &machine_reward_info.machine_stash, |old_value| {
+            *old_value += reward_to_stash
+        });
+
+        StashMachines::<T>::insert(&machine_reward_info.machine_stash, stash_machine);
+        MachineRecentReward::<T>::insert(&machine_id, machine_reward_info);
+    }
+
+    /// 计算当前Era在线奖励数量
+    pub fn current_era_reward() -> Option<BalanceOf<T>> {
+        let current_era = Self::current_era() as u64;
+        let phase_reward_info = Self::phase_reward_info()?;
+
+        let reward_start_era = phase_reward_info.online_reward_start_era as u64;
+        let era_duration = (current_era >= reward_start_era).then(|| current_era - reward_start_era)?;
+
+        let era_reward = if era_duration < phase_reward_info.first_phase_duration as u64 {
+            phase_reward_info.phase_0_reward_per_era
+        } else if era_duration < phase_reward_info.first_phase_duration as u64 + 1825 {
+            // 365 * 5
+            phase_reward_info.phase_1_reward_per_era
+        } else {
+            phase_reward_info.phase_2_reward_per_era
+        };
+
+        if Self::galaxy_is_on() && current_era < phase_reward_info.galaxy_on_era as u64 + 60 {
+            Some(era_reward.checked_mul(&2u32.saturated_into::<BalanceOf<T>>())?)
+        } else {
+            Some(era_reward)
+        }
+    }
+
+    // 计算当时机器实际获得的总奖励 (to_stash + to_committee)
+    fn calc_machine_total_reward(
+        machine_id: &MachineId,
+        machine_stash: &T::AccountId,
+        era_total_reward: BalanceOf<T>,
+        era_machine_points: &BTreeMap<MachineId, MachineGradeStatus>,
+        era_stash_points: &EraStashPoints<T::AccountId>,
+    ) -> BalanceOf<T> {
+        let machine_points = era_machine_points.get(machine_id);
+        let stash_points = era_stash_points.staker_statistic.get(machine_stash);
+        let machine_actual_grade = if machine_points.is_none() || stash_points.is_none() {
+            Zero::zero()
+        } else {
+            machine_points.unwrap().machine_actual_grade(stash_points.unwrap().inflation)
+        };
+
+        // 该Era机器获得的总奖励 (reward_to_stash + reward_to_committee)
+        if era_stash_points.total == 0 {
+            Zero::zero()
+        } else {
+            Perbill::from_rational_approximation(machine_actual_grade, era_stash_points.total) * era_total_reward
+        }
     }
 }

@@ -465,22 +465,6 @@ pub mod pallet {
         ValueQuery,
     >;
 
-    // TODO: NOTE: FIXME: 迁移数据
-
-    // #[pallet::storage]
-    // #[pallet::getter(fn next_slash_id)]
-    // pub(super) type NextSlashId<T: Config> = StorageValue<_, SlashId, ValueQuery>;
-
-    // #[pallet::storage]
-    // #[pallet::getter(fn pending_slash)]
-    // pub(super) type PendingSlash<T: Config> = StorageMap<
-    //     _,
-    //     Blake2_128Concat,
-    //     SlashId,
-    //     MTPendingSlashInfo<T::AccountId, T::BlockNumber, BalanceOf<T>>,
-    //     ValueQuery,
-    // >;
-
     #[pallet::call]
     impl<T: Config> Pallet<T> {
         #[pallet::weight(0)]
