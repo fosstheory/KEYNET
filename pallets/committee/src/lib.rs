@@ -9,6 +9,7 @@ use frame_support::{
     IterableStorageMap,
 };
 use frame_system::pallet_prelude::*;
+use generic_func::ItemList;
 use online_profile_machine::ManageCommittee;
 #[cfg(feature = "std")]
 use serde::{Deserialize, Serialize};
@@ -424,7 +425,6 @@ pub mod pallet {
 }
 
 impl<T: Config> Pallet<T> {
-    // 根据当前质押量，修改committee状态
     fn change_committee_status_when_stake_changed(
         committee: T::AccountId,
         committee_list: &mut CommitteeList<T::AccountId>,
@@ -433,26 +433,19 @@ impl<T: Config> Pallet<T> {
         let committee_stake_params = Self::committee_stake_params().unwrap_or_default();
         let is_free_stake_enough = committee_stake.staked_amount - committee_stake.used_stake >=
             committee_stake_params.min_free_stake_percent * committee_stake.staked_amount;
+        let mut is_committee_list_changed = false;
 
-        if is_free_stake_enough {
-            if let Ok(index) = committee_list.fulfilling_list.binary_search(&committee) {
-                committee_list.fulfilling_list.remove(index);
-                if let Err(index) = committee_list.normal.binary_search(&committee) {
-                    committee_list.normal.insert(index, committee);
-                    return true
-                }
-            }
-        } else {
-            if let Ok(index) = committee_list.normal.binary_search(&committee) {
-                committee_list.normal.remove(index);
-                if let Err(index) = committee_list.fulfilling_list.binary_search(&committee) {
-                    committee_list.fulfilling_list.insert(index, committee);
-                    return true
-                }
-            }
+        if is_free_stake_enough && committee_list.fulfilling_list.binary_search(&committee).is_ok() {
+            ItemList::rm_item(&mut committee_list.fulfilling_list, &committee);
+            ItemList::add_item(&mut committee_list.normal, committee);
+            is_committee_list_changed = true;
+        } else if !is_free_stake_enough && committee_list.normal.binary_search(&committee).is_ok() {
+            ItemList::rm_item(&mut committee_list.normal, &committee);
+            ItemList::add_item(&mut committee_list.fulfilling_list, committee);
+            is_committee_list_changed = true;
         }
 
-        false
+        is_committee_list_changed
     }
 }
 
