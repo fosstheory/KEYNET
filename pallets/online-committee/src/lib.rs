@@ -245,6 +245,13 @@ pub mod pallet {
 
     #[pallet::hooks]
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+        // TODO: add this
+        // fn on_initialize(_n: BlockNumberFor<T>) -> frame_support::weights::Weight {
+        //     Self::check_and_exec_pending_review();
+        //     Self::check_and_exec_pending_slash();
+        //     0
+        // }
+
         fn on_finalize(_block_number: T::BlockNumber) {
             Self::statistic_result();
             Self::distribute_machines();
