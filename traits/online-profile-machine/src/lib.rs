@@ -69,6 +69,7 @@ pub trait MTOps {
     type AccountId;
     type MachineId;
     type FaultType;
+    type Balance;
 
     fn mt_machine_offline(
         reporter: Self::AccountId,
@@ -76,6 +77,9 @@ pub trait MTOps {
         machine_id: Self::MachineId,
         fault_type: Self::FaultType,
     );
+    fn mt_change_staked_balance(stash: Self::AccountId, amount: Self::Balance, is_add: bool) -> Result<(), ()>;
+
+    fn mt_rm_stash_total_stake(stash: Self::AccountId, amount: Self::Balance) -> Result<(), ()>;
 }
 
 pub trait GNOps {
