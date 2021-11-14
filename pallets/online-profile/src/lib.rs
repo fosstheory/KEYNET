@@ -626,43 +626,43 @@ pub mod pallet {
     #[pallet::hooks]
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
         fn on_runtime_upgrade() -> Weight {
-            // 1. userReonlinestakeinfo -> usermuthardwarestakeinfo
-            let all_user_reonline_stake_info: Vec<(
-                T::AccountId,
-                MachineId,
-                UserReonlineStakeInfo<BalanceOf<T>, T::BlockNumber>,
-            )> = <UserReonlineStake<T> as IterableStorageDoubleMap<
-                T::AccountId,
-                MachineId,
-                UserReonlineStakeInfo<BalanceOf<T>, T::BlockNumber>,
-            >>::iter()
-            .map(|(k1, k2, v)| (k1, k2, v))
-            .collect();
+            // // 1. userReonlinestakeinfo -> usermuthardwarestakeinfo
+            // let all_user_reonline_stake_info: Vec<(
+            //     T::AccountId,
+            //     MachineId,
+            //     UserReonlineStakeInfo<BalanceOf<T>, T::BlockNumber>,
+            // )> = <UserReonlineStake<T> as IterableStorageDoubleMap<
+            //     T::AccountId,
+            //     MachineId,
+            //     UserReonlineStakeInfo<BalanceOf<T>, T::BlockNumber>,
+            // >>::iter()
+            // .map(|(k1, k2, v)| (k1, k2, v))
+            // .collect();
 
-            for a_item in all_user_reonline_stake_info {
-                UserMutHardwareStake::<T>::insert(
-                    a_item.0,
-                    a_item.1,
-                    UserMutHardwareStakeInfo {
-                        stake_amount: a_item.2.stake_amount,
-                        offline_time: a_item.2.offline_time,
-                    },
-                );
-            }
+            // for a_item in all_user_reonline_stake_info {
+            //     UserMutHardwareStake::<T>::insert(
+            //         a_item.0,
+            //         a_item.1,
+            //         UserMutHardwareStakeInfo {
+            //             stake_amount: a_item.2.stake_amount,
+            //             offline_time: a_item.2.offline_time,
+            //         },
+            //     );
+            // }
 
-            // 4. phase_reward_info 的设置
-            let reward_start_era = Self::reward_start_era().unwrap_or_default();
-            let phase_0_reward_per_era = Self::phase_n_reward_per_era(0).unwrap_or_default();
-            let phase_1_reward_per_era = Self::phase_n_reward_per_era(1).unwrap_or_default();
-            let phase_2_reward_per_era = Self::phase_n_reward_per_era(2).unwrap_or_default();
-            PhaseRewardInfo::<T>::put(PhaseRewardInfoDetail {
-                online_reward_start_era: reward_start_era,
-                first_phase_duration: 100,
-                galaxy_on_era: 0,
-                phase_0_reward_per_era,
-                phase_1_reward_per_era,
-                phase_2_reward_per_era,
-            });
+            // // 4. phase_reward_info 的设置
+            // let reward_start_era = Self::reward_start_era().unwrap_or_default();
+            // let phase_0_reward_per_era = Self::phase_n_reward_per_era(0).unwrap_or_default();
+            // let phase_1_reward_per_era = Self::phase_n_reward_per_era(1).unwrap_or_default();
+            // let phase_2_reward_per_era = Self::phase_n_reward_per_era(2).unwrap_or_default();
+            // PhaseRewardInfo::<T>::put(PhaseRewardInfoDetail {
+            //     online_reward_start_era: reward_start_era,
+            //     first_phase_duration: 100,
+            //     galaxy_on_era: 0,
+            //     phase_0_reward_per_era,
+            //     phase_1_reward_per_era,
+            //     phase_2_reward_per_era,
+            // });
 
             // 6. 生成all_machine_id_snap
             let mut all_machine_id = Vec::new();
@@ -671,14 +671,15 @@ pub mod pallet {
                 let stash_machine = Self::stash_machines(a_stash);
                 all_machine_id.extend(stash_machine.total_machine);
             }
-            let machine_num = all_machine_id.len() as u64;
-            AllMachineIdSnap::<T>::put((all_machine_id.clone(), machine_num));
+            // let machine_num = all_machine_id.len() as u64;
+            // AllMachineIdSnap::<T>::put((all_machine_id.clone(), machine_num));
 
             // 5. 生成machine_recent_reward
             let current_era = Self::current_era();
 
             for a_machine in all_machine_id.clone() {
-                let mut machine_recent_reward = Self::machine_recent_reward(&a_machine);
+                // let mut machine_recent_reward = Self::machine_recent_reward(&a_machine);
+                let mut machine_recent_reward = MachineRecentRewardInfo::default();
                 let machine_info = Self::machines_info(&a_machine);
 
                 machine_recent_reward.machine_stash = machine_info.machine_stash;
