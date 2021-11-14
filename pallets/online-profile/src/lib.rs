@@ -422,18 +422,18 @@ pub mod pallet {
     #[pallet::getter(fn standard_gpu_point_price)]
     pub(super) type StandardGPUPointPrice<T: Config> = StorageValue<_, StandardGpuPointPrice>;
 
-    // /// Reonline to change hardware, should stake some balance
-    // #[pallet::storage]
-    // #[pallet::getter(fn user_reonline_stake)]
-    // pub(super) type UserReonlineStake<T: Config> = StorageDoubleMap<
-    //     _,
-    //     Blake2_128Concat,
-    //     T::AccountId,
-    //     Blake2_128Concat,
-    //     MachineId,
-    //     UserReonlineStakeInfo<BalanceOf<T>, T::BlockNumber>,
-    //     ValueQuery,
-    // >;
+    /// Reonline to change hardware, should stake some balance
+    #[pallet::storage]
+    #[pallet::getter(fn user_reonline_stake)]
+    pub(super) type UserReonlineStake<T: Config> = StorageDoubleMap<
+        _,
+        Blake2_128Concat,
+        T::AccountId,
+        Blake2_128Concat,
+        MachineId,
+        UserReonlineStakeInfo<BalanceOf<T>, T::BlockNumber>,
+        ValueQuery,
+    >;
 
     // TODO: FIXME 上面变成了下面
 
@@ -526,26 +526,12 @@ pub mod pallet {
     #[pallet::storage]
     #[pallet::getter(fn eras_stash_points)]
     pub(super) type ErasStashPoints<T: Config> =
-        StorageMap<_, Blake2_128Concat, EraIndex, EraStashPoints<T::AccountId>>;
-
-    // TODO: FIXME: !! !!! 变成下面的
-    /// 每个Era机器的得分快照
-    #[pallet::storage]
-    #[pallet::getter(fn eras_stash_points2)]
-    pub(super) type ErasStashPoints2<T: Config> =
         StorageMap<_, Blake2_128Concat, EraIndex, EraStashPoints<T::AccountId>, ValueQuery>;
 
     /// 每个Era机器的得分快照
     #[pallet::storage]
     #[pallet::getter(fn eras_machine_points)]
     pub(super) type ErasMachinePoints<T: Config> =
-        StorageMap<_, Blake2_128Concat, EraIndex, BTreeMap<MachineId, MachineGradeStatus>>;
-
-    // FIXME: 变成下面
-    /// 每个Era机器的得分快照
-    #[pallet::storage]
-    #[pallet::getter(fn eras_machine_points2)]
-    pub(super) type ErasMachinePoints2<T: Config> =
         StorageMap<_, Blake2_128Concat, EraIndex, BTreeMap<MachineId, MachineGradeStatus>, ValueQuery>;
 
     /// 在线奖励开始时间
@@ -641,16 +627,72 @@ pub mod pallet {
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
         fn on_runtime_upgrade() -> Weight {
             // 1. userReonlinestakeinfo -> usermuthardwarestakeinfo
+            let all_user_reonline_stake_info: Vec<(
+                T::AccountId,
+                MachineId,
+                UserReonlineStakeInfo<BalanceOf<T>, T::BlockNumber>,
+            )> = <UserReonlineStake<T> as IterableStorageDoubleMap<
+                T::AccountId,
+                MachineId,
+                UserReonlineStakeInfo<BalanceOf<T>, T::BlockNumber>,
+            >>::iter()
+            .map(|(k1, k2, v)| (k1, k2, v))
+            .collect();
 
-            // 2. eras_stash_points 1 -> 2
-
-            // 3. eras_machine_points 1 -> 2
+            for a_item in all_user_reonline_stake_info {
+                UserMutHardwareStake::<T>::insert(
+                    a_item.0,
+                    a_item.1,
+                    UserMutHardwareStakeInfo {
+                        stake_amount: a_item.2.stake_amount,
+                        offline_time: a_item.2.offline_time,
+                    },
+                );
+            }
 
             // 4. phase_reward_info 的设置
-
-            // 5. 生成machine_recent_reward
+            let reward_start_era = Self::reward_start_era().unwrap_or_default();
+            let phase_0_reward_per_era = Self::phase_n_reward_per_era(0).unwrap_or_default();
+            let phase_1_reward_per_era = Self::phase_n_reward_per_era(1).unwrap_or_default();
+            let phase_2_reward_per_era = Self::phase_n_reward_per_era(2).unwrap_or_default();
+            PhaseRewardInfo::<T>::put(PhaseRewardInfoDetail {
+                online_reward_start_era: reward_start_era,
+                first_phase_duration: 100,
+                galaxy_on_era: 0,
+                phase_0_reward_per_era,
+                phase_1_reward_per_era,
+                phase_2_reward_per_era,
+            });
 
             // 6. 生成all_machine_id_snap
+            let mut all_machine_id = Vec::new();
+            let all_stash = Self::get_all_stash();
+            for a_stash in &all_stash {
+                let stash_machine = Self::stash_machines(a_stash);
+                all_machine_id.extend(stash_machine.total_machine);
+            }
+            let machine_num = all_machine_id.len() as u64;
+            AllMachineIdSnap::<T>::put((all_machine_id.clone(), machine_num));
+
+            // 5. 生成machine_recent_reward
+            let current_era = Self::current_era();
+
+            for a_machine in all_machine_id.clone() {
+                let mut machine_recent_reward = Self::machine_recent_reward(&a_machine);
+                let machine_info = Self::machines_info(&a_machine);
+
+                machine_recent_reward.machine_stash = machine_info.machine_stash;
+                machine_recent_reward.reward_committee_deadline = machine_info.reward_deadline;
+                machine_recent_reward.reward_committee = machine_info.reward_committee;
+
+                // TODO: check if should add current_era
+                for i in 0..current_era {
+                    let machine_reward = Self::eras_machine_reward(i, a_machine.clone());
+                    machine_recent_reward.add_new_reward(machine_reward);
+                }
+                MachineRecentReward::<T>::insert(a_machine, machine_recent_reward);
+            }
+
             0
         }
 
@@ -1480,7 +1522,7 @@ impl<T: Config> Pallet<T> {
 
     // 获取下一Era stash grade即为当前Era stash grade
     fn get_stash_grades(era_index: EraIndex, stash: &T::AccountId) -> u64 {
-        let next_era_stash_snapshot = Self::eras_stash_points2(era_index);
+        let next_era_stash_snapshot = Self::eras_stash_points(era_index);
 
         if let Some(stash_snapshot) = next_era_stash_snapshot.staker_statistic.get(stash) {
             return stash_snapshot.total_grades().unwrap_or_default()
@@ -1499,10 +1541,10 @@ impl<T: Config> Pallet<T> {
         let machine_base_info = machine_info.machine_info_detail.committee_upload_info.clone();
         let current_era = Self::current_era();
 
-        let mut current_era_stash_snap = Self::eras_stash_points2(current_era);
-        let mut next_era_stash_snap = Self::eras_stash_points2(current_era + 1);
-        let mut current_era_machine_snap = Self::eras_machine_points2(current_era);
-        let mut next_era_machine_snap = Self::eras_machine_points2(current_era + 1);
+        let mut current_era_stash_snap = Self::eras_stash_points(current_era);
+        let mut next_era_stash_snap = Self::eras_stash_points(current_era + 1);
+        let mut current_era_machine_snap = Self::eras_machine_points(current_era);
+        let mut next_era_machine_snap = Self::eras_machine_points(current_era + 1);
 
         let mut stash_machine = Self::stash_machines(&machine_info.machine_stash);
         let mut sys_info = Self::sys_info();
@@ -1582,10 +1624,10 @@ impl<T: Config> Pallet<T> {
         let machine_info = Self::machines_info(&machine_id);
         let current_era = Self::current_era();
 
-        let mut current_era_stash_snap = Self::eras_stash_points2(current_era);
-        let mut next_era_stash_snap = Self::eras_stash_points2(current_era + 1);
-        let mut current_era_machine_snap = Self::eras_machine_points2(current_era);
-        let mut next_era_machine_snap = Self::eras_machine_points2(current_era + 1);
+        let mut current_era_stash_snap = Self::eras_stash_points(current_era);
+        let mut next_era_stash_snap = Self::eras_stash_points(current_era + 1);
+        let mut current_era_machine_snap = Self::eras_machine_points(current_era);
+        let mut next_era_machine_snap = Self::eras_machine_points(current_era + 1);
 
         let mut stash_machine = Self::stash_machines(&machine_info.machine_stash);
         let mut sys_info = Self::sys_info();
@@ -2140,8 +2182,8 @@ impl<T: Config> Module<T> {
 
                 let release_era = Self::current_era() - 1;
                 let era_total_reward = Self::era_reward(release_era);
-                let era_machine_points = Self::eras_machine_points2(release_era);
-                let era_stash_points = Self::eras_stash_points2(release_era);
+                let era_machine_points = Self::eras_machine_points(release_era);
+                let era_stash_points = Self::eras_stash_points(release_era);
 
                 for _ in 0..=release_num {
                     if let Some(machine_id) = all_machine.0.pop_front() {
@@ -2172,19 +2214,19 @@ impl<T: Config> Module<T> {
         EraReward::<T>::insert(current_era, era_reward);
 
         if current_era == 1 {
-            ErasStashPoints2::<T>::insert(0, EraStashPoints { ..Default::default() });
-            ErasStashPoints2::<T>::insert(1, EraStashPoints { ..Default::default() });
-            ErasStashPoints2::<T>::insert(2, EraStashPoints { ..Default::default() });
+            ErasStashPoints::<T>::insert(0, EraStashPoints { ..Default::default() });
+            ErasStashPoints::<T>::insert(1, EraStashPoints { ..Default::default() });
+            ErasStashPoints::<T>::insert(2, EraStashPoints { ..Default::default() });
             let init_value: BTreeMap<MachineId, MachineGradeStatus> = BTreeMap::new();
-            ErasMachinePoints2::<T>::insert(0, init_value.clone());
-            ErasMachinePoints2::<T>::insert(1, init_value.clone());
-            ErasMachinePoints2::<T>::insert(2, init_value);
+            ErasMachinePoints::<T>::insert(0, init_value.clone());
+            ErasMachinePoints::<T>::insert(1, init_value.clone());
+            ErasMachinePoints::<T>::insert(2, init_value);
         } else {
             // 用当前的Era快照初始化下一个Era的信息
-            let current_era_stash_snapshot = Self::eras_stash_points2(current_era);
-            ErasStashPoints2::<T>::insert(current_era + 1, current_era_stash_snapshot);
-            let current_era_machine_snapshot = Self::eras_machine_points2(current_era);
-            ErasMachinePoints2::<T>::insert(current_era + 1, current_era_machine_snapshot);
+            let current_era_stash_snapshot = Self::eras_stash_points(current_era);
+            ErasStashPoints::<T>::insert(current_era + 1, current_era_stash_snapshot);
+            let current_era_machine_snapshot = Self::eras_machine_points(current_era);
+            ErasMachinePoints::<T>::insert(current_era + 1, current_era_machine_snapshot);
         }
     }
 
