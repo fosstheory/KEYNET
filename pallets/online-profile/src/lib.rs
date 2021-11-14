@@ -703,8 +703,8 @@ pub mod pallet {
                 // 每个Era(2880个块)执行一次
                 Self::update_snap_for_new_era();
             }
-            Self::check_offline_machine_duration();
-            Self::do_pending_slash();
+            // Self::check_offline_machine_duration();
+            // Self::do_pending_slash();
             0
         }
 
