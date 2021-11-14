@@ -685,9 +685,8 @@ pub mod pallet {
                 machine_recent_reward.reward_committee_deadline = machine_info.reward_deadline;
                 machine_recent_reward.reward_committee = machine_info.reward_committee;
 
-                // TODO: check if should add current_era
                 for i in 0..current_era {
-                    let machine_reward = Self::eras_machine_reward(i, a_machine.clone());
+                    let machine_reward = Self::eras_machine_reward(i, &a_machine);
                     machine_recent_reward.add_new_reward(machine_reward);
                 }
                 MachineRecentReward::<T>::insert(a_machine, machine_recent_reward);
