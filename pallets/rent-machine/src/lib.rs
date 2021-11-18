@@ -91,23 +91,6 @@ pub mod pallet {
     #[pallet::hooks]
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
         fn on_runtime_upgrade() -> frame_support::weights::Weight {
-            // let all_renter: Vec<T::AccountId> = <UserRented<T> as IterableStorageMap<T::AccountId, _>>::iter()
-            //     .map(|(renter, _)| renter)
-            //     .collect::<Vec<_>>();
-
-            // for a_renter in all_renter {
-            //     let user_rented = Self::user_rented(&a_renter);
-            //     for a_machine in user_rented {
-            //         let rent_info = Self::rent_order(&a_renter, &a_machine).unwrap_or_default();
-
-            //         let mut pending_rent_ending = Self::pending_rent_ending(rent_info.rent_end);
-            //         ItemList::add_item(&mut pending_rent_ending, a_machine.clone());
-            //         PendingRentEnding::<T>::insert(rent_info.rent_end, pending_rent_ending);
-
-            //         RentOrder2::<T>::insert(a_machine.clone(), rent_info);
-            //     }
-            // }
-
             0
         }
 

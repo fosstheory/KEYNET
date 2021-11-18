@@ -77,6 +77,12 @@ pub struct StashMachine<Balance> {
     pub total_burn_fee: Balance,
 }
 
+#[derive(PartialEq, Encode, Decode, Default, RuntimeDebug, Clone)]
+pub struct AllMachineIdSnapDetail {
+    pub all_machine_id: VecDeque<MachineId>,
+    pub snap_len: u64,
+}
+
 /// All details of a machine
 #[derive(PartialEq, Eq, Clone, Encode, Decode, Default, RuntimeDebug)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
@@ -626,73 +632,6 @@ pub mod pallet {
     #[pallet::hooks]
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
         fn on_runtime_upgrade() -> Weight {
-            // // 1. userReonlinestakeinfo -> usermuthardwarestakeinfo
-            // let all_user_reonline_stake_info: Vec<(
-            //     T::AccountId,
-            //     MachineId,
-            //     UserReonlineStakeInfo<BalanceOf<T>, T::BlockNumber>,
-            // )> = <UserReonlineStake<T> as IterableStorageDoubleMap<
-            //     T::AccountId,
-            //     MachineId,
-            //     UserReonlineStakeInfo<BalanceOf<T>, T::BlockNumber>,
-            // >>::iter()
-            // .map(|(k1, k2, v)| (k1, k2, v))
-            // .collect();
-
-            // for a_item in all_user_reonline_stake_info {
-            //     UserMutHardwareStake::<T>::insert(
-            //         a_item.0,
-            //         a_item.1,
-            //         UserMutHardwareStakeInfo {
-            //             stake_amount: a_item.2.stake_amount,
-            //             offline_time: a_item.2.offline_time,
-            //         },
-            //     );
-            // }
-
-            // // 4. phase_reward_info 的设置
-            // let reward_start_era = Self::reward_start_era().unwrap_or_default();
-            // let phase_0_reward_per_era = Self::phase_n_reward_per_era(0).unwrap_or_default();
-            // let phase_1_reward_per_era = Self::phase_n_reward_per_era(1).unwrap_or_default();
-            // let phase_2_reward_per_era = Self::phase_n_reward_per_era(2).unwrap_or_default();
-            // PhaseRewardInfo::<T>::put(PhaseRewardInfoDetail {
-            //     online_reward_start_era: reward_start_era,
-            //     first_phase_duration: 100,
-            //     galaxy_on_era: 0,
-            //     phase_0_reward_per_era,
-            //     phase_1_reward_per_era,
-            //     phase_2_reward_per_era,
-            // });
-
-            // 6. 生成all_machine_id_snap
-            let mut all_machine_id = Vec::new();
-            let all_stash = Self::get_all_stash();
-            for a_stash in &all_stash {
-                let stash_machine = Self::stash_machines(a_stash);
-                all_machine_id.extend(stash_machine.total_machine);
-            }
-            // let machine_num = all_machine_id.len() as u64;
-            // AllMachineIdSnap::<T>::put((all_machine_id.clone(), machine_num));
-
-            // 5. 生成machine_recent_reward
-            let current_era = Self::current_era();
-
-            for a_machine in all_machine_id.clone() {
-                // let mut machine_recent_reward = Self::machine_recent_reward(&a_machine);
-                let mut machine_recent_reward = MachineRecentRewardInfo::default();
-                let machine_info = Self::machines_info(&a_machine);
-
-                machine_recent_reward.machine_stash = machine_info.machine_stash;
-                machine_recent_reward.reward_committee_deadline = machine_info.reward_deadline;
-                machine_recent_reward.reward_committee = machine_info.reward_committee;
-
-                for i in 0..current_era {
-                    let machine_reward = Self::eras_machine_reward(i, &a_machine);
-                    machine_recent_reward.add_new_reward(machine_reward);
-                }
-                MachineRecentReward::<T>::insert(a_machine, machine_recent_reward);
-            }
-
             0
         }
 
@@ -704,34 +643,12 @@ pub mod pallet {
                 // 每个Era(2880个块)执行一次
                 Self::update_snap_for_new_era();
             }
-            // Self::check_offline_machine_duration();
-            // Self::do_pending_slash();
             0
         }
-
-        // fn on_finalize(block_number: T::BlockNumber) {
-        //     // let current_height = block_number.saturated_into::<u64>();
-
-        //     // // 在每个Era结束时执行奖励，发放到用户的Machine
-        //     // // 计算奖励，直接根据当前得分即可
-        //     // if current_height > 0 && current_height % BLOCK_PER_ERA == 0 {
-        //     //     Self::distribute_reward();
-        //     // }
-
-        //     // let _ = Self::do_pending_slash();
-        // }
     }
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        // /// When reward start to distribute
-        // #[pallet::weight(0)]
-        // pub fn set_reward_start_era(origin: OriginFor<T>, reward_start_era: EraIndex) -> DispatchResultWithPostInfo {
-        //     ensure_root(origin)?;
-        //     RewardStartEra::<T>::put(reward_start_era);
-        //     Ok(().into())
-        // }
-
         // FIXME: 上面改成下面
         /// When reward start to distribute
         #[pallet::weight(0)]
@@ -2195,6 +2112,7 @@ impl<T: Config> Module<T> {
                             &era_stash_points,
                         );
                     } else {
+                        AllMachineIdSnap::<T>::put(all_machine);
                         return
                     }
                 }
