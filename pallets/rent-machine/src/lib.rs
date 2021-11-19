@@ -218,14 +218,25 @@ pub mod pallet {
             ItemList::add_item(&mut user_rented, machine_id.clone());
             UserRented::<T>::insert(&renter, user_rented);
 
-            let mut pending_rent_ending = Self::pending_rent_ending(rent_end);
-            ItemList::add_item(&mut pending_rent_ending, machine_id.clone());
-            PendingRentEnding::<T>::insert(rent_end, pending_rent_ending);
-
             // 改变online_profile状态，影响机器佣金
             T::RTOps::change_machine_status(&machine_id, MachineStatus::Creating, Some(renter.clone()), None);
 
             PendingConfirming::<T>::insert(&machine_id, renter);
+            Ok(().into())
+        }
+
+        #[pallet::weight(10000)]
+        pub fn root_rm_pending_end(
+            origin: OriginFor<T>,
+            block_number: T::BlockNumber,
+            machine_id: MachineId,
+        ) -> DispatchResultWithPostInfo {
+            ensure_root(origin)?;
+
+            let mut pending_rent_ending = Self::pending_rent_ending(block_number);
+            ItemList::rm_item(&mut pending_rent_ending, &machine_id);
+            PendingRentEnding::<T>::insert(block_number, pending_rent_ending);
+
             Ok(().into())
         }
 
@@ -254,7 +265,11 @@ pub mod pallet {
             order_info.confirm_rent = now;
             order_info.stake_amount = Zero::zero();
             order_info.rent_status = RentStatus::Renting;
-            RentOrder2::<T>::insert(&machine_id, order_info);
+            RentOrder2::<T>::insert(&machine_id, order_info.clone());
+
+            let mut pending_rent_ending = Self::pending_rent_ending(order_info.rent_end);
+            ItemList::add_item(&mut pending_rent_ending, machine_id.clone());
+            PendingRentEnding::<T>::insert(order_info.rent_end, pending_rent_ending);
 
             // 改变online_profile状态
             T::RTOps::change_machine_status(&machine_id, MachineStatus::Rented, Some(renter.clone()), None);

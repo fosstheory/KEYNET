@@ -716,6 +716,20 @@ pub mod pallet {
             Ok(().into())
         }
 
+        #[pallet::weight(10000)]
+        pub fn root_set_machine_status(
+            origin: OriginFor<T>,
+            machine_id: MachineId,
+            machine_status: MachineStatus<T::BlockNumber, T::AccountId>,
+        ) -> DispatchResultWithPostInfo {
+            ensure_root(origin)?;
+            let mut machine_info = Self::machines_info(&machine_id);
+            machine_info.machine_status = machine_status;
+            MachinesInfo::<T>::insert(&machine_id, machine_info);
+
+            Ok(().into())
+        }
+
         /// Stash account set a controller
         #[pallet::weight(10000)]
         pub fn set_controller(origin: OriginFor<T>, controller: T::AccountId) -> DispatchResultWithPostInfo {
@@ -1834,7 +1848,6 @@ impl<T: Config> RTOps for Pallet<T> {
             .checked_div(10_000)
     }
 
-    // TODO: change here
     fn change_machine_status(
         machine_id: &MachineId,
         new_status: MachineStatus<T::BlockNumber, T::AccountId>,
@@ -1885,6 +1898,8 @@ impl<T: Config> RTOps for Pallet<T> {
                     }
 
                     LiveMachines::<T>::put(live_machines);
+                } else {
+                    machine_info.machine_status = new_status;
                 }
             },
             MachineStatus::Creating => machine_info.machine_status = new_status,
