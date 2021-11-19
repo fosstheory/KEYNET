@@ -717,14 +717,10 @@ pub mod pallet {
         }
 
         #[pallet::weight(10000)]
-        pub fn root_set_machine_status(
-            origin: OriginFor<T>,
-            machine_id: MachineId,
-            machine_status: MachineStatus<T::BlockNumber, T::AccountId>,
-        ) -> DispatchResultWithPostInfo {
+        pub fn root_set_machine_status(origin: OriginFor<T>, machine_id: MachineId) -> DispatchResultWithPostInfo {
             ensure_root(origin)?;
             let mut machine_info = Self::machines_info(&machine_id);
-            machine_info.machine_status = machine_status;
+            machine_info.machine_status = MachineStatus::Online;
             MachinesInfo::<T>::insert(&machine_id, machine_info);
 
             Ok(().into())
